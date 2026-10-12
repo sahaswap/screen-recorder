@@ -37,3 +37,21 @@ send outside the company.
 
 If the site sends you to a separate sign-in page on another domain, the recorder treats it
 as a separate site. Add a Note such as "SSO login here" instead of recording it.
+
+## 3. ecm-export.js - export transactions for many alerts
+
+Built from the recording. For each alert ID it opens
+`/ECM/Case/Statistics.aspx?caseid=<ID>`, runs **Export Transactions**, and saves the file
+to Downloads as `<ID>_<file name>`.
+
+1. Log in to ECM in Edge and open the Dashboard.
+2. Start it: Ctrl+Shift+J, paste `ecm-export.js`, Enter. Or add `ecm-export-bookmarklet.txt`
+   as a favorite named `Export` and click it.
+3. The box is pre-filled with the alert IDs from My Case Queue. Edit the list, or paste your
+   own IDs (one per line, or separated by commas).
+4. Press **Start**. Each alert shows OK or the reason it failed.
+
+The first time, Edge may ask to allow this site to download multiple files. Choose **Allow**.
+If an alert cannot be exported in the background, the tool opens it in a tab and clicks the
+button instead. For that, allow pop-ups for the ECM site when Edge asks.
+If the session expires, it stops and asks you to log in again.
