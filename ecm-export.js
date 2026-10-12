@@ -20,7 +20,9 @@
   var results = [];
   var BUTTON_ID = 'btnExportStatsTransactions';
   var CLICK_WAIT_MS = 10000; /* after clicking Export: time allowed for the download to start */
-  var PAUSE_MS = 1000;     /* pause between alerts, to go easy on the server */
+  var PAUSE_MS = 300;      /* pause between alerts, to go easy on the server */
+  var POLL_MS = 200;       /* how often a loading page is checked */
+  var PAGE_TIMEOUT_MS = 60000;
   var stopped = false;
   var running = false;
 
@@ -178,20 +180,23 @@
   }
 
   /* Load a page in an off-screen frame (not a pop-up, so never blocked), wait until ready(doc)
-     returns something, then call use(doc, thatValue). On failure use(null, reason). */
+     returns something, then call use(doc, thatValue). On failure use(null, reason).
+     ready() is tried as soon as the page's own content is parsed - it does not wait for
+     embedded frames and images unless it chooses to. */
   async function withFrame(url, ready, use) {
     var f = document.createElement('iframe');
     f.style.cssText = FRAME_CSS;
     f.src = url;
     document.body.appendChild(f);
     try {
-      var d, r = null;
-      for (var i = 0; i < 120 && !r; i++) {
-        await sleep(500);
+      var d, r = null, waited = 0;
+      while (!r && waited < PAGE_TIMEOUT_MS) {
+        await sleep(POLL_MS);
+        waited += POLL_MS;
         try { d = f.contentDocument; } catch (e) { d = null; }
         if (!d) return await use(null, 'page could not load (error page or frames not allowed)');
         if (isLogin(d.location.href)) throw new Error('LOGIN');
-        if (d.readyState === 'complete' && d.location.href !== 'about:blank') r = ready(d);
+        if (d.readyState !== 'loading' && d.location.href !== 'about:blank') r = ready(d);
       }
       return await use(r ? d : null, r || 'page did not finish loading');
     } finally {
@@ -199,9 +204,18 @@
     }
   }
 
+  /* Every stylesheet has arrived, so hidden help text is really hidden. */
+  function stylesLoaded(d) {
+    return Array.prototype.every.call(d.querySelectorAll('link[rel~="stylesheet"]'), function (l) { return !!l.sheet; });
+  }
+
+  async function waitComplete(d) {
+    for (var waited = 0; d.readyState !== 'complete' && waited < PAGE_TIMEOUT_MS; waited += POLL_MS) await sleep(POLL_MS);
+  }
+
   function readInfo(id) {
     return withFrame(REQ_BASE + id, function (d) {
-      return d.body && /Customer Name/i.test(d.body.innerText) ? true : null;
+      return d.body && stylesLoaded(d) && /Customer Name/i.test(d.body.innerText) ? true : null;
     }, function (d, why) {
       if (!d) return { error: why };
       return {
@@ -214,33 +228,37 @@
     });
   }
 
-  /* Post the live page's form ourselves so the file can be named and confirmed. */
-  async function postExport(d, btn, id) {
+  /* Post the live page's form ourselves so the file can be named and confirmed.
+     Returns { blob, disp, type } or null when the server sent no file. */
+  async function postExport(d, btn) {
     var form = btn.form || btn.closest('form');
-    if (!form) return 'no form';
+    if (!form) return null;
     var action = new URL(form.getAttribute('action') || d.location.href, d.location.href).href;
     var post = await fetch(action, { method: 'POST', credentials: 'same-origin', body: formBody(form, btn) });
     if (isLogin(post.url)) throw new Error('LOGIN');
     var type = post.headers.get('content-type') || '';
     var disp = post.headers.get('content-disposition') || '';
-    if (!post.ok || (!/attachment/i.test(disp) && /text\/html/i.test(type))) return 'no file';
+    if (!post.ok || (!/attachment/i.test(disp) && /text\/html/i.test(type))) return null;
     var blob = await post.blob();
     /* An error page sent without a proper content type is not a file. */
-    if (!/attachment/i.test(disp) && /^\s*<(!doctype|html)/i.test(await blob.slice(0, 200).text())) return 'no file';
-    var name = fileName(disp, type, id);
-    saveBlob(blob, name);
-    return 'OK ' + name;
+    if (!/attachment/i.test(disp) && /^\s*<(!doctype|html)/i.test(await blob.slice(0, 200).text())) return null;
+    return { blob: blob, disp: disp, type: type };
   }
 
-  /* Export from the Statistics page. If our own post gets no file, click the real button instead. */
-  function exportAlert(id, prefix) {
+  /* Export from the Statistics page. Tried as soon as the button exists; if that gets no
+     file, again once the whole page (embedded frames too) has loaded; last of all the real
+     button is clicked. Returns { blob, disp, type } or { result: text }. */
+  function getExport(id) {
     return withFrame(BASE + id, function (d) { return d.getElementById(BUTTON_ID); }, async function (d, btnEl) {
-      if (!d) return btnEl === 'page did not finish loading' ? 'no Export button on page' : btnEl;
-      var result = await postExport(d, btnEl, prefix);
-      if (result.indexOf('OK') === 0) return result;
+      if (!d) return { result: btnEl === 'page did not finish loading' ? 'no Export button on page' : btnEl };
+      var file = await postExport(d, btnEl);
+      if (file) return file;
+      await waitComplete(d);
+      file = await postExport(d, btnEl);
+      if (file) return file;
       btnEl.click();
       await sleep(CLICK_WAIT_MS);
-      return 'OK (clicked Export, file keeps its original name)';
+      return { result: 'OK (clicked Export, file keeps its original name)' };
     });
   }
 
@@ -324,20 +342,27 @@
     for (var i = 0; i < ids.length && !stopped; i++) {
       var id = ids[i];
       var tag = '[' + (i + 1) + '/' + ids.length + '] ' + id;
-      var line = log(tag + ' reading details ...');
-      var info = {}, result;
+      var line = log(tag + ' working ...');
+      var info = {}, result, started = Date.now();
       try {
-        info = await readInfo(id);
+        /* Details and export pages load side by side. */
+        var both = await Promise.all([readInfo(id), getExport(id)]);
+        info = both[0];
+        var ex = both[1];
         if (info.error) tag += ' (details: ' + info.error + ')';
         else tag += ' ' + (info.velocity || '(no Velocity ID found)');
-        line.textContent = tag + ' exporting ...';
-        var prefix = info.velocity ? id + '_' + safeName(info.velocity) : id;
-        result = await exportAlert(id, prefix);
+        if (ex.blob) {
+          var name = fileName(ex.disp, ex.type, info.velocity ? id + '_' + safeName(info.velocity) : id);
+          saveBlob(ex.blob, name);
+          result = 'OK ' + name;
+        } else {
+          result = ex.result;
+        }
       } catch (e) {
         if (e.message === 'LOGIN') { line.textContent = tag + ' session expired'; log('Log in to ECM again, then press Start.'); break; }
         result = 'error: ' + e.message;
       }
-      line.textContent = tag + ' ' + result;
+      line.textContent = tag + ' ' + result + '  (' + ((Date.now() - started) / 1000).toFixed(1) + ' s)';
       results.push({
         ecm: id, velocity: info.velocity || '', customer: info.customer || '', internalId: info.internalId || '',
         address: info.address, permanent: info.permanent,
