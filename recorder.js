@@ -5,11 +5,16 @@
   Typed values are NEVER recorded - only which field was used.
   Run: paste into the browser console (F12 > Console), or use the bookmarklet.
   Run again (or click Stop) to stop. Log survives page reloads and is shared by all tabs on the same site.
+  Tabs opened from a recording tab start recording by themselves (same site only).
 */
-(function () {
+(function vdiRec() {
   if (window.__vdiRec) { window.__vdiRec.stop(); return; }
 
   var KEY = '__vdiRecLog';
+  var STOP_KEY = '__vdiRecStopped';
+  var SRC = '(' + vdiRec.toString() + ')();';
+  var watchers = [];
+  var origOpen = window.open;
   var FILE_RX = /\.(xlsx?|xlsm|csv|pdf|zip|txt|docx?|xml|json|dat)(\?|#|$)/i;
   var log = load();
   var lastUrl = location.href;
@@ -74,6 +79,24 @@
     });
   }
 
+  /* Keep starting the recorder in a tab we opened, including after it reloads. */
+  function watch(w) {
+    var t = setInterval(function () {
+      try {
+        if (w.closed) { clearInterval(t); return; }
+        if (localStorage.getItem(STOP_KEY)) return;
+        if (w.location.href !== 'about:blank' && w.document.readyState === 'complete' && w.document.body && !w.__vdiRec) w.eval(SRC);
+      } catch (e) { /* other site or not loaded yet */ }
+    }, 700);
+    watchers.push(t);
+  }
+
+  window.open = function () {
+    var w = origOpen.apply(window, arguments);
+    if (w) watch(w);
+    return w;
+  };
+
   function onClick(e) {
     if (panel.contains(e.target)) return;
     var el = e.target.closest('a,button,input,select,textarea,label,[role=button],[role=link],[role=tab],[role=menuitem],[onclick]') || e.target;
@@ -81,7 +104,16 @@
     if (el.href) ev.href = el.href;
     if (el.hasAttribute('download')) ev.download = el.getAttribute('download') || true;
     if (el.type) ev.inputType = el.type;
+    if (el.target) ev.target = el.target;
     add(ev);
+
+    /* Same-site link opening a new tab: open it ourselves so we can follow it. */
+    if (el.tagName === 'A' && el.target && el.target !== '_self' && !el.hasAttribute('download') &&
+        el.origin === location.origin && !e.defaultPrevented && !e.ctrlKey && !e.shiftKey && !e.metaKey) {
+      e.preventDefault();
+      var w = origOpen.call(window, el.href, el.target);
+      if (w) watch(w);
+    }
   }
 
   function onChange(e) {
@@ -164,6 +196,9 @@
   function render() { status.textContent = '● REC  ' + log.length + ' steps'; status.style.color = '#f87171'; }
 
   function stop() {
+    try { localStorage.setItem(STOP_KEY, '1'); } catch (e) {}
+    window.open = origOpen;
+    watchers.forEach(clearInterval);
     clearInterval(timer);
     document.removeEventListener('click', onClick, true);
     document.removeEventListener('change', onChange, true);
@@ -183,5 +218,6 @@
   document.addEventListener('change', onChange, true);
   document.addEventListener('submit', onSubmit, true);
   window.__vdiRec = { stop: stop };
+  try { localStorage.removeItem(STOP_KEY); } catch (e) {}
   pageEvent();
 })();

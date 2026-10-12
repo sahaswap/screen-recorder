@@ -24,7 +24,9 @@ Pick one way to start it:
 A red "REC" box appears at the bottom right. Do the download steps the way you normally
 would. Use **Note** to explain anything the recorder cannot see, such as "waited 30s".
 
-- After each full page reload, click the bookmarklet again. The steps so far are kept.
+- Alert pages that open in a new tab start recording by themselves, and keep recording
+  when they reload. Only the first tab needs the recorder pasted in.
+- If the first tab itself fully reloads, start the recorder again there. The steps so far are kept.
 - When finished, click **Save** (saves `recording.json`) or **Copy**.
 
 What gets recorded: page URLs, link and button text, field names, dropdown choices, and
