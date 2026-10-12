@@ -52,6 +52,7 @@ to Downloads as `<ID>_<file name>`.
 4. Press **Start**. Each alert shows OK or the reason it failed.
 
 The first time, Edge may ask to allow this site to download multiple files. Choose **Allow**.
-If an alert cannot be exported in the background, the tool opens it in a tab and clicks the
+If an alert cannot be exported in the background, the tool loads it in a hidden frame and
+clicks the button (no pop-up). Only if that also fails does it open a tab and click the
 button instead. For that, allow pop-ups for the ECM site when Edge asks.
 If the session expires, it stops and asks you to log in again.

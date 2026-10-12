@@ -10,7 +10,7 @@
 
   var BASE = location.origin + '/ECM/Case/Statistics.aspx?caseid=';
   var BUTTON_ID = 'btnExportStatsTransactions';
-  var TAB_WAIT_MS = 10000; /* fallback mode: time allowed for a download to start before closing the tab */
+  var TAB_WAIT_MS = 10000; /* frame/tab modes: time allowed for a download to start before closing */
   var PAUSE_MS = 1000;     /* pause between alerts, to go easy on the server */
   var stopped = false;
   var running = false;
@@ -109,7 +109,32 @@
     return 'server did not return a file';
   }
 
-  /* Fallback mode: open the page in a tab and click the button, like a person would. */
+  /* Fallback 1: load the page in a hidden frame and click the button. Not a pop-up, so never blocked. */
+  async function viaFrame(id) {
+    var f = document.createElement('iframe');
+    f.style.cssText = 'position:fixed;left:-10000px;top:0;width:1200px;height:800px;border:0;visibility:hidden';
+    f.src = BASE + id;
+    document.body.appendChild(f);
+    try {
+      var btn = null;
+      for (var i = 0; i < 120 && !btn; i++) {
+        await sleep(500);
+        var d;
+        try { d = f.contentDocument; } catch (e) { return 'page refuses to load in a frame'; }
+        if (!d) return 'page refuses to load in a frame';
+        if (isLogin(d.location.href)) throw new Error('LOGIN');
+        if (d.readyState === 'complete' && d.location.href !== 'about:blank') btn = d.getElementById(BUTTON_ID);
+      }
+      if (!btn) return 'no Export button on page';
+      btn.click();
+      await sleep(TAB_WAIT_MS);
+      return 'OK (frame mode, check Downloads)';
+    } finally {
+      f.remove();
+    }
+  }
+
+  /* Fallback 2: open the page in a tab and click the button, like a person would. */
   async function viaTab(id) {
     var w = window.open(BASE + id, '_blank');
     if (!w) return 'pop-up blocked - allow pop-ups for this site';
@@ -173,6 +198,10 @@
       var result;
       try {
         result = await viaFetch(id);
+        if (result.indexOf('OK') !== 0) {
+          line.textContent += ' ' + result + ', trying frame mode ...';
+          result = await viaFrame(id);
+        }
         if (result.indexOf('OK') !== 0) {
           line.textContent += ' ' + result + ', trying tab mode ...';
           result = await viaTab(id);
