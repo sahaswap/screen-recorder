@@ -4,7 +4,7 @@
   so a download macro can be built from them.
   Typed values are NEVER recorded - only which field was used.
   Run: paste into the browser console (F12 > Console), or use the bookmarklet.
-  Run again (or click Stop) to stop. Log survives page reloads on the same site.
+  Run again (or click Stop) to stop. Log survives page reloads and is shared by all tabs on the same site.
 */
 (function () {
   if (window.__vdiRec) { window.__vdiRec.stop(); return; }
@@ -16,7 +16,8 @@
 
   function load() { try { return JSON.parse(localStorage.getItem(KEY)) || []; } catch (e) { return []; } }
   function save() { try { localStorage.setItem(KEY, JSON.stringify(log)); } catch (e) {} }
-  function add(ev) { ev.at = new Date().toISOString(); log.push(ev); save(); render(); }
+  /* Re-read before every write so several tabs on the same site share one log. */
+  function add(ev) { ev.at = new Date().toISOString(); log = load(); log.push(ev); save(); render(); }
 
   function clean(s) { return (s || '').trim().replace(/\s+/g, ' ').slice(0, 80); }
 
@@ -104,6 +105,7 @@
 
   var timer = setInterval(function () {
     if (location.href !== lastUrl) { lastUrl = location.href; pageEvent(); }
+    else { var n = load().length; if (n !== log.length) { log = load(); render(); } }
   }, 500);
 
   /* ---------- floating control panel ---------- */
@@ -125,6 +127,7 @@
   }
 
   function output() {
+    log = load();
     return JSON.stringify({ recorder: 'vdi-rec v1', browser: navigator.userAgent, events: log }, null, 2);
   }
 
