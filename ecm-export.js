@@ -10,7 +10,7 @@
 
   var BASE = location.origin + '/ECM/Case/Statistics.aspx?caseid=';
   var BUTTON_ID = 'btnExportStatsTransactions';
-  var TAB_WAIT_MS = 10000; /* frame/tab modes: time allowed for a download to start before closing */
+  var CLICK_WAIT_MS = 10000; /* after clicking Export: time allowed for the download to start */
   var PAUSE_MS = 1000;     /* pause between alerts, to go easy on the server */
   var stopped = false;
   var running = false;
@@ -82,74 +82,48 @@
 
   function isLogin(url) { return /\/Login/i.test(url); }
 
-  /* Main mode: load the page and post the export in the background (no tabs). */
-  async function viaFetch(id) {
-    var url = BASE + id;
-    var res = await fetch(url, { credentials: 'same-origin' });
-    if (isLogin(res.url)) throw new Error('LOGIN');
-    if (!res.ok) return 'page error ' + res.status;
-    var doc = new DOMParser().parseFromString(await res.text(), 'text/html');
-    var btn = doc.getElementById(BUTTON_ID);
-    if (!btn) return 'no Export button on page';
+  /* Post the live page's form ourselves so the file can be named and confirmed. */
+  async function postExport(d, btn, id) {
     var form = btn.form || btn.closest('form');
     if (!form) return 'no form';
-    var action = new URL(form.getAttribute('action') || res.url, res.url).href;
+    var action = new URL(form.getAttribute('action') || d.location.href, d.location.href).href;
     var post = await fetch(action, { method: 'POST', credentials: 'same-origin', body: formBody(form, btn) });
     if (isLogin(post.url)) throw new Error('LOGIN');
     var type = post.headers.get('content-type') || '';
     var disp = post.headers.get('content-disposition') || '';
-    if (post.ok && (/attachment/i.test(disp) || !/text\/html/i.test(type))) {
-      var blob = await post.blob();
-      /* An error page sent without a proper content type is not a file. */
-      if (!/attachment/i.test(disp) && /^\s*<(!doctype|html)/i.test(await blob.slice(0, 200).text())) return 'server did not return a file';
-      var name = fileName(disp, type, id);
-      saveBlob(blob, name);
-      return 'OK ' + name;
-    }
-    return 'server did not return a file';
+    if (!post.ok || (!/attachment/i.test(disp) && /text\/html/i.test(type))) return 'no file';
+    var blob = await post.blob();
+    /* An error page sent without a proper content type is not a file. */
+    if (!/attachment/i.test(disp) && /^\s*<(!doctype|html)/i.test(await blob.slice(0, 200).text())) return 'no file';
+    var name = fileName(disp, type, id);
+    saveBlob(blob, name);
+    return 'OK ' + name;
   }
 
-  /* Fallback 1: load the page in a hidden frame and click the button. Not a pop-up, so never blocked. */
-  async function viaFrame(id) {
+  /* Load the alert's Statistics page in a hidden frame (not a pop-up, so never blocked),
+     then export from it. If our own post gets no file, click the real button instead. */
+  async function exportAlert(id) {
     var f = document.createElement('iframe');
     f.style.cssText = 'position:fixed;left:-10000px;top:0;width:1200px;height:800px;border:0;visibility:hidden';
     f.src = BASE + id;
     document.body.appendChild(f);
     try {
-      var btn = null;
+      var d, btn = null;
       for (var i = 0; i < 120 && !btn; i++) {
         await sleep(500);
-        var d;
         try { d = f.contentDocument; } catch (e) { return 'page refuses to load in a frame'; }
         if (!d) return 'page refuses to load in a frame';
         if (isLogin(d.location.href)) throw new Error('LOGIN');
         if (d.readyState === 'complete' && d.location.href !== 'about:blank') btn = d.getElementById(BUTTON_ID);
       }
       if (!btn) return 'no Export button on page';
+      var result = await postExport(d, btn, id);
+      if (result.indexOf('OK') === 0) return result;
       btn.click();
-      await sleep(TAB_WAIT_MS);
-      return 'OK (frame mode, check Downloads)';
+      await sleep(CLICK_WAIT_MS);
+      return 'OK (clicked Export, file keeps its original name)';
     } finally {
       f.remove();
-    }
-  }
-
-  /* Fallback 2: open the page in a tab and click the button, like a person would. */
-  async function viaTab(id) {
-    var w = window.open(BASE + id, '_blank');
-    if (!w) return 'pop-up blocked - allow pop-ups for this site';
-    try {
-      var btn = null;
-      for (var i = 0; i < 120 && !btn; i++) {
-        await sleep(500);
-        try { if (w.document.readyState === 'complete') btn = w.document.getElementById(BUTTON_ID); } catch (e) { /* still loading */ }
-      }
-      if (!btn) return 'no Export button on page';
-      btn.click();
-      await sleep(TAB_WAIT_MS);
-      return 'OK (tab mode, check Downloads)';
-    } finally {
-      try { w.close(); } catch (e) { /* already closed */ }
     }
   }
 
@@ -197,15 +171,7 @@
       var line = log('[' + (i + 1) + '/' + ids.length + '] ' + id + ' ...');
       var result;
       try {
-        result = await viaFetch(id);
-        if (result.indexOf('OK') !== 0) {
-          line.textContent += ' ' + result + ', trying frame mode ...';
-          result = await viaFrame(id);
-        }
-        if (result.indexOf('OK') !== 0) {
-          line.textContent += ' ' + result + ', trying tab mode ...';
-          result = await viaTab(id);
-        }
+        result = await exportAlert(id);
       } catch (e) {
         if (e.message === 'LOGIN') { line.textContent += ' session expired'; log('Log in to ECM again, then press Start.'); break; }
         result = 'error: ' + e.message;
