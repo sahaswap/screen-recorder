@@ -1,7 +1,7 @@
 /*
   ECM Transactions Export
   For each alert ID (ECM case ID):
-    1. reads Customer Name, Customer Internal ID and Velocity Alert ID from the Requirements page;
+    1. reads Customer Name, Customer Internal ID, Address and Velocity Alert ID from the Requirements page;
     2. runs "Export Transactions" on the Statistics page, saving the file to Downloads as
        <ECM ID>_<Velocity Alert ID>_<original file name>;
   then saves ECM_Alert_Info_<date>.csv (one row per alert) for the Excel tool.
@@ -15,7 +15,9 @@
   var REQ_BASE = location.origin + '/ECM/Case/Requirements.aspx?caseid=';
   /* Off-screen but rendered: page text is only readable from a frame that is not hidden. */
   var FRAME_CSS = 'position:fixed;left:-10000px;top:0;width:1200px;height:800px;border:0;opacity:0;pointer-events:none';
-  var COLUMNS = ['ECM ID', 'Velocity Alert ID', 'Customer Name', 'Customer Internal ID', 'Transaction File', 'Result'];
+  var COLUMNS = ['ECM ID', 'Velocity Alert ID', 'Customer Name', 'Customer Internal ID', 'Address', 'Transaction File', 'Result'];
+  /* Labels tried in order for the customer's address; the first one found on the page is used. */
+  var ADDRESS_LABELS = ['Customer Address', 'Primary Address', 'Mailing Address', 'Street Address', 'Address'];
   var results = [];
   var BUTTON_ID = 'btnExportStatsTransactions';
   var CLICK_WAIT_MS = 10000; /* after clicking Export: time allowed for the download to start */
@@ -95,8 +97,9 @@
   /* Value shown next to a label such as "Customer Name:" - on the same line, or in a text box /
      text in the label's own row. preferBox checks the row first (requirement fields, whose label
      sits beside help text). Hidden elements are ignored, and the search never climbs into an
-     area holding a second label, so it cannot pick up the next field's value. */
-  function readField(doc, label, preferBox) {
+     area holding a second label, so it cannot pick up the next field's value.
+     multiLine keeps every line of the value (addresses), joined with ", ". */
+  function readField(doc, label, preferBox, multiLine) {
     var rx = new RegExp('^\\s*' + label + '\\s*:?\\s*', 'i');
     var shown = function (el) { return el.getClientRects().length > 0; };
     var els = Array.prototype.filter.call(doc.querySelectorAll('body *'), function (el) {
@@ -113,7 +116,8 @@
     }
     function inlineValue() {
       for (var j = 0; j < els.length; j++) {
-        var rest = els[j].innerText.trim().replace(rx, '').split('\n')[0].trim();
+        var rest = els[j].innerText.trim().replace(rx, '');
+        rest = multiLine ? joinLines(rest.split('\n')) : rest.split('\n')[0].trim();
         if (rest) return rest;
       }
       return '';
@@ -128,12 +132,24 @@
           var lines = (a.innerText || '').split('\n').map(function (x) { return x.trim(); }).filter(function (x) {
             return x && x !== '?' && !rx.test(x) && !/:\s*$/.test(x);
           });
-          if (lines.length) return lines[0];
+          if (lines.length) return multiLine ? joinLines(lines) : lines[0];
         }
       }
       return '';
     }
     return preferBox ? (rowValue() || inlineValue()) : (inlineValue() || rowValue());
+  }
+
+  function joinLines(lines) {
+    return lines.map(function (x) { return x.trim(); }).filter(Boolean).join(', ').slice(0, 300);
+  }
+
+  function readAddress(doc) {
+    for (var i = 0; i < ADDRESS_LABELS.length; i++) {
+      var v = readField(doc, ADDRESS_LABELS[i], false, true);
+      if (v) return v;
+    }
+    return '';
   }
 
   /* Load a page in an off-screen frame (not a pop-up, so never blocked), wait until ready(doc)
@@ -166,6 +182,7 @@
       return {
         customer: readField(d, 'Customer Name'),
         internalId: readField(d, 'Customer Internal ID'),
+        address: readAddress(d),
         velocity: readField(d, 'Velocity Alert ID', true)
       };
     });
@@ -208,7 +225,7 @@
   }
 
   function tableRows() {
-    return results.map(function (r) { return [r.ecm, r.velocity, r.customer, r.internalId, r.file, r.result]; });
+    return results.map(function (r) { return [r.ecm, r.velocity, r.customer, r.internalId, r.address, r.file, r.result]; });
   }
 
   function saveCsv() {
@@ -293,6 +310,7 @@
       line.textContent = tag + ' ' + result;
       results.push({
         ecm: id, velocity: info.velocity || '', customer: info.customer || '', internalId: info.internalId || '',
+        address: info.address || '',
         file: result.indexOf('OK ') === 0 && result.indexOf('OK (') !== 0 ? result.slice(3) : '', result: result
       });
       if (result.indexOf('OK') === 0) ok++; else failed.push(id);
