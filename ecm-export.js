@@ -1,7 +1,10 @@
 /*
   ECM Transactions Export
-  For each alert ID, opens the alert's Statistics page and runs "Export Transactions",
-  saving the file to Downloads as <alertId>_<original file name>.
+  For each alert ID (ECM case ID):
+    1. reads Customer Name, Customer Internal ID and Velocity Alert ID from the Requirements page;
+    2. runs "Export Transactions" on the Statistics page, saving the file to Downloads as
+       <ECM ID>_<Velocity Alert ID>_<original file name>;
+  then saves ECM_Alert_Info_<date>.csv (one row per alert) for the Excel tool.
   Run on any ECM page while logged in: paste into the Console (Ctrl+Shift+J) or use the bookmarklet.
   Uses your existing Edge session - no passwords are stored or sent anywhere else.
 */
@@ -9,6 +12,11 @@
   if (document.getElementById('__ecmExport')) return;
 
   var BASE = location.origin + '/ECM/Case/Statistics.aspx?caseid=';
+  var REQ_BASE = location.origin + '/ECM/Case/Requirements.aspx?caseid=';
+  /* Off-screen but rendered: page text is only readable from a frame that is not hidden. */
+  var FRAME_CSS = 'position:fixed;left:-10000px;top:0;width:1200px;height:800px;border:0;opacity:0;pointer-events:none';
+  var COLUMNS = ['ECM ID', 'Velocity Alert ID', 'Customer Name', 'Customer Internal ID', 'Transaction File', 'Result'];
+  var results = [];
   var BUTTON_ID = 'btnExportStatsTransactions';
   var CLICK_WAIT_MS = 10000; /* after clicking Export: time allowed for the download to start */
   var PAUSE_MS = 1000;     /* pause between alerts, to go easy on the server */
@@ -82,6 +90,87 @@
 
   function isLogin(url) { return /\/Login/i.test(url); }
 
+  function safeName(s) { return (s || '').replace(/[\\\/:*?"<>|\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60); }
+
+  /* Value shown next to a label such as "Customer Name:" - on the same line, or in a text box /
+     text in the label's own row. preferBox checks the row first (requirement fields, whose label
+     sits beside help text). Hidden elements are ignored, and the search never climbs into an
+     area holding a second label, so it cannot pick up the next field's value. */
+  function readField(doc, label, preferBox) {
+    var rx = new RegExp('^\\s*' + label + '\\s*:?\\s*', 'i');
+    var shown = function (el) { return el.getClientRects().length > 0; };
+    var els = Array.prototype.filter.call(doc.querySelectorAll('body *'), function (el) {
+      if (/^(SCRIPT|STYLE|OPTION|SELECT|TEXTAREA)$/.test(el.tagName) || !shown(el)) return false;
+      var t = (el.innerText || '').trim();
+      return t.length < 400 && rx.test(t);
+    });
+    els = els.filter(function (el) { return !els.some(function (o) { return o !== el && el.contains(o); }); });
+
+    function labelCount(area) {
+      return Array.prototype.filter.call(area.querySelectorAll('*'), function (e) {
+        return !e.children.length && shown(e) && /^[^:\n]{2,60}:\s*$/.test((e.innerText || '').trim());
+      }).length;
+    }
+    function inlineValue() {
+      for (var j = 0; j < els.length; j++) {
+        var rest = els[j].innerText.trim().replace(rx, '').split('\n')[0].trim();
+        if (rest) return rest;
+      }
+      return '';
+    }
+    function rowValue() {
+      for (var j = 0; j < els.length; j++) {
+        for (var a = els[j].parentElement, k = 0; a && k < 4; a = a.parentElement, k++) {
+          if (labelCount(a) > 1) break;
+          var inp = a.querySelector('input:not([type=hidden]):not([type=button]):not([type=submit]):not([type=checkbox]):not([type=radio]), select, textarea');
+          var val = inp ? (inp.tagName === 'SELECT' ? (inp.options[inp.selectedIndex] || {}).text : inp.value) : '';
+          if (val && val.trim()) return val.trim();
+          var lines = (a.innerText || '').split('\n').map(function (x) { return x.trim(); }).filter(function (x) {
+            return x && x !== '?' && !rx.test(x) && !/:\s*$/.test(x);
+          });
+          if (lines.length) return lines[0];
+        }
+      }
+      return '';
+    }
+    return preferBox ? (rowValue() || inlineValue()) : (inlineValue() || rowValue());
+  }
+
+  /* Load a page in an off-screen frame (not a pop-up, so never blocked), wait until ready(doc)
+     returns something, then call use(doc, thatValue). On failure use(null, reason). */
+  async function withFrame(url, ready, use) {
+    var f = document.createElement('iframe');
+    f.style.cssText = FRAME_CSS;
+    f.src = url;
+    document.body.appendChild(f);
+    try {
+      var d, r = null;
+      for (var i = 0; i < 120 && !r; i++) {
+        await sleep(500);
+        try { d = f.contentDocument; } catch (e) { d = null; }
+        if (!d) return await use(null, 'page refuses to load in a frame');
+        if (isLogin(d.location.href)) throw new Error('LOGIN');
+        if (d.readyState === 'complete' && d.location.href !== 'about:blank') r = ready(d);
+      }
+      return await use(r ? d : null, r || 'page did not finish loading');
+    } finally {
+      f.remove();
+    }
+  }
+
+  function readInfo(id) {
+    return withFrame(REQ_BASE + id, function (d) {
+      return d.body && /Customer Name/i.test(d.body.innerText) ? true : null;
+    }, function (d, why) {
+      if (!d) return { error: why };
+      return {
+        customer: readField(d, 'Customer Name'),
+        internalId: readField(d, 'Customer Internal ID'),
+        velocity: readField(d, 'Velocity Alert ID', true)
+      };
+    });
+  }
+
   /* Post the live page's form ourselves so the file can be named and confirmed. */
   async function postExport(d, btn, id) {
     var form = btn.form || btn.closest('form');
@@ -100,31 +189,49 @@
     return 'OK ' + name;
   }
 
-  /* Load the alert's Statistics page in a hidden frame (not a pop-up, so never blocked),
-     then export from it. If our own post gets no file, click the real button instead. */
-  async function exportAlert(id) {
-    var f = document.createElement('iframe');
-    f.style.cssText = 'position:fixed;left:-10000px;top:0;width:1200px;height:800px;border:0;visibility:hidden';
-    f.src = BASE + id;
-    document.body.appendChild(f);
-    try {
-      var d, btn = null;
-      for (var i = 0; i < 120 && !btn; i++) {
-        await sleep(500);
-        try { d = f.contentDocument; } catch (e) { return 'page refuses to load in a frame'; }
-        if (!d) return 'page refuses to load in a frame';
-        if (isLogin(d.location.href)) throw new Error('LOGIN');
-        if (d.readyState === 'complete' && d.location.href !== 'about:blank') btn = d.getElementById(BUTTON_ID);
-      }
-      if (!btn) return 'no Export button on page';
-      var result = await postExport(d, btn, id);
+  /* Export from the Statistics page. If our own post gets no file, click the real button instead. */
+  function exportAlert(id, prefix) {
+    return withFrame(BASE + id, function (d) { return d.getElementById(BUTTON_ID); }, async function (d, btnEl) {
+      if (!d) return btnEl === 'page did not finish loading' ? 'no Export button on page' : btnEl;
+      var result = await postExport(d, btnEl, prefix);
       if (result.indexOf('OK') === 0) return result;
-      btn.click();
+      btnEl.click();
       await sleep(CLICK_WAIT_MS);
       return 'OK (clicked Export, file keeps its original name)';
-    } finally {
-      f.remove();
-    }
+    });
+  }
+
+  function csvCell(v) {
+    v = String(v == null ? '' : v);
+    if (/^[=+\-@]/.test(v)) v = "'" + v; /* stop Excel treating a value as a formula */
+    return '"' + v.replace(/"/g, '""') + '"';
+  }
+
+  function tableRows() {
+    return results.map(function (r) { return [r.ecm, r.velocity, r.customer, r.internalId, r.file, r.result]; });
+  }
+
+  function saveCsv() {
+    if (!results.length) return;
+    var lines = [COLUMNS].concat(tableRows()).map(function (cells) { return cells.map(csvCell).join(','); });
+    var now = new Date();
+    var stamp = now.getFullYear() + ('0' + (now.getMonth() + 1)).slice(-2) + ('0' + now.getDate()).slice(-2) + '_' +
+      ('0' + now.getHours()).slice(-2) + ('0' + now.getMinutes()).slice(-2);
+    saveBlob(new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv' }), 'ECM_Alert_Info_' + stamp + '.csv');
+  }
+
+  function copyForExcel() {
+    if (!results.length) { log('Nothing to copy yet - press Start first.'); return; }
+    var tsv = [COLUMNS].concat(tableRows()).map(function (cells) {
+      return cells.map(function (c) { return String(c == null ? '' : c).replace(/[\t\r\n]+/g, ' '); }).join('\t');
+    }).join('\r\n');
+    var done = function () { log('Copied ' + results.length + ' rows. Click a cell in Excel and press Ctrl+V.'); };
+    var fallback = function () {
+      var ta = document.createElement('textarea');
+      ta.value = tsv; document.body.appendChild(ta); ta.select();
+      document.execCommand('copy'); ta.remove(); done();
+    };
+    if (navigator.clipboard) navigator.clipboard.writeText(tsv).then(done, fallback); else fallback();
   }
 
   /* ---------- panel ---------- */
@@ -165,27 +272,41 @@
     if (!ids.length) { log('Enter at least one alert ID.'); return; }
     running = true; stopped = false;
     logEl.textContent = '';
+    results = [];
     var ok = 0, failed = [];
     for (var i = 0; i < ids.length && !stopped; i++) {
       var id = ids[i];
-      var line = log('[' + (i + 1) + '/' + ids.length + '] ' + id + ' ...');
-      var result;
+      var tag = '[' + (i + 1) + '/' + ids.length + '] ' + id;
+      var line = log(tag + ' reading details ...');
+      var info = {}, result;
       try {
-        result = await exportAlert(id);
+        info = await readInfo(id);
+        if (info.error) tag += ' (details: ' + info.error + ')';
+        else tag += ' ' + (info.velocity || '(no Velocity ID found)');
+        line.textContent = tag + ' exporting ...';
+        var prefix = info.velocity ? id + '_' + safeName(info.velocity) : id;
+        result = await exportAlert(id, prefix);
       } catch (e) {
-        if (e.message === 'LOGIN') { line.textContent += ' session expired'; log('Log in to ECM again, then press Start.'); break; }
+        if (e.message === 'LOGIN') { line.textContent = tag + ' session expired'; log('Log in to ECM again, then press Start.'); break; }
         result = 'error: ' + e.message;
       }
-      line.textContent = '[' + (i + 1) + '/' + ids.length + '] ' + id + ' ' + result;
+      line.textContent = tag + ' ' + result;
+      results.push({
+        ecm: id, velocity: info.velocity || '', customer: info.customer || '', internalId: info.internalId || '',
+        file: result.indexOf('OK ') === 0 && result.indexOf('OK (') !== 0 ? result.slice(3) : '', result: result
+      });
       if (result.indexOf('OK') === 0) ok++; else failed.push(id);
       await sleep(PAUSE_MS);
     }
     log((stopped ? 'Stopped. ' : 'Finished. ') + ok + ' exported' + (failed.length ? ', failed: ' + failed.join(', ') : '.'));
+    saveCsv();
+    if (results.length) log('Saved ECM_Alert_Info CSV to Downloads. "Copy for Excel" copies the same table.');
     running = false;
   }
 
   btn('Start', run);
   btn('Stop', function () { stopped = true; });
+  btn('Copy for Excel', copyForExcel);
   btn('Load my queue', function () {
     var ids = queueIds();
     box.value = ids.join('\n');

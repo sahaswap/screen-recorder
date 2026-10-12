@@ -40,9 +40,16 @@ as a separate site. Add a Note such as "SSO login here" instead of recording it.
 
 ## 3. ecm-export.js - export transactions for many alerts
 
-Built from the recording. For each alert ID it opens
-`/ECM/Case/Statistics.aspx?caseid=<ID>`, runs **Export Transactions**, and saves the file
-to Downloads as `<ID>_<file name>`.
+Built from the recording. For each alert (ECM) ID it:
+
+1. Opens the alert's **Requirements** page and reads Customer Name, Customer Internal ID and
+   Velocity Alert ID.
+2. Opens the **Statistics** page, runs **Export Transactions**, and saves the file to Downloads
+   as `<ECM ID>_<Velocity Alert ID>_<file name>`.
+
+At the end it saves `ECM_Alert_Info_<date>_<time>.csv` to Downloads with one row per alert:
+ECM ID, Velocity Alert ID, Customer Name, Customer Internal ID, Transaction File, Result.
+**Copy for Excel** copies the same table, ready to paste into a sheet.
 
 1. Log in to ECM in Edge and open the Dashboard.
 2. Start it: Ctrl+Shift+J, paste `ecm-export.js`, Enter. Or add `ecm-export-bookmarklet.txt`
