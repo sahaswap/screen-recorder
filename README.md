@@ -42,13 +42,15 @@ as a separate site. Add a Note such as "SSO login here" instead of recording it.
 
 Built from the recording. For each alert (ECM) ID it:
 
-1. Opens the alert's **Requirements** page and reads Customer Name, Customer Internal ID, Address and
-   Velocity Alert ID.
+1. Opens the alert's **Requirements** page and reads Customer Name, Customer Internal ID,
+   Velocity Alert ID, the address (Street Address, City, State, Zip Code, Country) and the
+   permanent address.
 2. Opens the **Statistics** page, runs **Export Transactions**, and saves the file to Downloads
    as `<ECM ID>_<Velocity Alert ID>_<file name>`.
 
 At the end it saves `ECM_Alert_Info_<date>_<time>.csv` to Downloads with one row per alert:
-ECM ID, Velocity Alert ID, Customer Name, Customer Internal ID, Address, Transaction File, Result.
+ECM ID, Velocity Alert ID, Customer Name, Customer Internal ID, Address (combined), Street, City,
+State, Zip Code, Country, Permanent Address (combined), Transaction File, Result.
 **Copy for Excel** copies the same table, ready to paste into a sheet.
 
 1. Log in to ECM in Edge and open the Dashboard.

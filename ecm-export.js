@@ -1,7 +1,7 @@
 /*
   ECM Transactions Export
   For each alert ID (ECM case ID):
-    1. reads Customer Name, Customer Internal ID, Address and Velocity Alert ID from the Requirements page;
+    1. reads Customer Name, Customer Internal ID, current and permanent address, and Velocity Alert ID from the Requirements page;
     2. runs "Export Transactions" on the Statistics page, saving the file to Downloads as
        <ECM ID>_<Velocity Alert ID>_<original file name>;
   then saves ECM_Alert_Info_<date>.csv (one row per alert) for the Excel tool.
@@ -15,9 +15,8 @@
   var REQ_BASE = location.origin + '/ECM/Case/Requirements.aspx?caseid=';
   /* Off-screen but rendered: page text is only readable from a frame that is not hidden. */
   var FRAME_CSS = 'position:fixed;left:-10000px;top:0;width:1200px;height:800px;border:0;opacity:0;pointer-events:none';
-  var COLUMNS = ['ECM ID', 'Velocity Alert ID', 'Customer Name', 'Customer Internal ID', 'Address', 'Transaction File', 'Result'];
-  /* Labels tried in order for the customer's address; the first one found on the page is used. */
-  var ADDRESS_LABELS = ['Customer Address', 'Primary Address', 'Mailing Address', 'Street Address', 'Address'];
+  var COLUMNS = ['ECM ID', 'Velocity Alert ID', 'Customer Name', 'Customer Internal ID', 'Address',
+    'Street', 'City', 'State', 'Zip Code', 'Country', 'Permanent Address', 'Transaction File', 'Result'];
   var results = [];
   var BUTTON_ID = 'btnExportStatsTransactions';
   var CLICK_WAIT_MS = 10000; /* after clicking Export: time allowed for the download to start */
@@ -97,59 +96,85 @@
   /* Value shown next to a label such as "Customer Name:" - on the same line, or in a text box /
      text in the label's own row. preferBox checks the row first (requirement fields, whose label
      sits beside help text). Hidden elements are ignored, and the search never climbs into an
-     area holding a second label, so it cannot pick up the next field's value.
-     multiLine keeps every line of the value (addresses), joined with ", ". */
-  function readField(doc, label, preferBox, multiLine) {
+     area holding a second label, so it cannot pick up the next field's value. */
+  function readField(doc, label, preferBox) {
+    /* Label must be followed by ":" or end of line, so "State" never matches "Statement". */
+    var match = new RegExp('^\\s*' + label + '\\s*(:|\\n|$)', 'i');
     var rx = new RegExp('^\\s*' + label + '\\s*:?\\s*', 'i');
     var shown = function (el) { return el.getClientRects().length > 0; };
     var els = Array.prototype.filter.call(doc.querySelectorAll('body *'), function (el) {
       if (/^(SCRIPT|STYLE|OPTION|SELECT|TEXTAREA)$/.test(el.tagName) || !shown(el)) return false;
       var t = (el.innerText || '').trim();
-      return t.length < 400 && rx.test(t);
+      return t.length < 400 && match.test(t);
     });
     els = els.filter(function (el) { return !els.some(function (o) { return o !== el && el.contains(o); }); });
 
-    function labelCount(area) {
+    /* Labels for other fields inside an area (e.g. "City:" when looking for "Street Address"). */
+    function otherLabels(area) {
       return Array.prototype.filter.call(area.querySelectorAll('*'), function (e) {
-        return !e.children.length && shown(e) && /^[^:\n]{2,60}:\s*$/.test((e.innerText || '').trim());
+        var t = (e.innerText || '').trim();
+        return !e.children.length && shown(e) && /^[^:\n]{2,60}:\s*$/.test(t) && !match.test(t);
       }).length;
+    }
+    function boxText(inp) {
+      if (inp.tagName !== 'SELECT') return inp.value;
+      var o = inp.options[inp.selectedIndex];
+      return o && o.value !== '' && !/^\s*(--|select\b)/i.test(o.text) ? o.text : '';
     }
     function inlineValue() {
       for (var j = 0; j < els.length; j++) {
-        var rest = els[j].innerText.trim().replace(rx, '');
-        rest = multiLine ? joinLines(rest.split('\n')) : rest.split('\n')[0].trim();
+        var rest = els[j].innerText.trim().replace(rx, '').split('\n')[0].trim();
         if (rest) return rest;
       }
       return '';
     }
+    var blank = false; /* the row has an empty box: the field is blank */
     function rowValue() {
       for (var j = 0; j < els.length; j++) {
         for (var a = els[j].parentElement, k = 0; a && k < 4; a = a.parentElement, k++) {
-          if (labelCount(a) > 1) break;
+          if (otherLabels(a) > 0) break;
           var inp = a.querySelector('input:not([type=hidden]):not([type=button]):not([type=submit]):not([type=checkbox]):not([type=radio]), select, textarea');
-          var val = inp ? (inp.tagName === 'SELECT' ? (inp.options[inp.selectedIndex] || {}).text : inp.value) : '';
+          var val = inp ? boxText(inp) : '';
           if (val && val.trim()) return val.trim();
+          if (inp) { blank = true; break; } /* do not read help text instead */
           var lines = (a.innerText || '').split('\n').map(function (x) { return x.trim(); }).filter(function (x) {
-            return x && x !== '?' && !rx.test(x) && !/:\s*$/.test(x);
+            return x && x !== '?' && !match.test(x) && !/:\s*$/.test(x);
           });
-          if (lines.length) return multiLine ? joinLines(lines) : lines[0];
+          if (lines.length) return lines[0];
         }
       }
       return '';
     }
-    return preferBox ? (rowValue() || inlineValue()) : (inlineValue() || rowValue());
+    if (!preferBox) return inlineValue() || rowValue();
+    var v = rowValue();
+    return v || (blank ? '' : inlineValue());
   }
 
-  function joinLines(lines) {
-    return lines.map(function (x) { return x.trim(); }).filter(Boolean).join(', ').slice(0, 300);
-  }
-
-  function readAddress(doc) {
-    for (var i = 0; i < ADDRESS_LABELS.length; i++) {
-      var v = readField(doc, ADDRESS_LABELS[i], false, true);
+  function firstField(doc, labels) {
+    for (var i = 0; i < labels.length; i++) {
+      var v = readField(doc, labels[i], true);
       if (v) return v;
     }
     return '';
+  }
+
+  /* "US - United States" -> "US" for the combined address. */
+  function shortCode(v) { var m = /^([A-Z]{2,3}) - /.exec(v); return m ? m[1] : v; }
+
+  /* Address from the requirement fields: Street Address, City, State, Zip Code, Country
+     (or the same fields prefixed "Permanent"). */
+  function readAddress(doc, permanent) {
+    var p = permanent ? 'Permanent ' : '';
+    var a = {
+      street: firstField(doc, permanent ? ['Permanent Address', 'Permanent Street Address'] : ['Street Address']),
+      city: firstField(doc, [p + 'City']),
+      state: firstField(doc, [p + 'State']),
+      zip: firstField(doc, [p + 'Zip Code', p + 'Zip', p + 'Postal Code']),
+      country: firstField(doc, [p + 'Country'])
+    };
+    a.full = [a.street, a.city, [shortCode(a.state), a.zip].filter(Boolean).join(' '), shortCode(a.country)]
+      .filter(Boolean).join(', ');
+    return a;
   }
 
   /* Load a page in an off-screen frame (not a pop-up, so never blocked), wait until ready(doc)
@@ -164,7 +189,7 @@
       for (var i = 0; i < 120 && !r; i++) {
         await sleep(500);
         try { d = f.contentDocument; } catch (e) { d = null; }
-        if (!d) return await use(null, 'page refuses to load in a frame');
+        if (!d) return await use(null, 'page could not load (error page or frames not allowed)');
         if (isLogin(d.location.href)) throw new Error('LOGIN');
         if (d.readyState === 'complete' && d.location.href !== 'about:blank') r = ready(d);
       }
@@ -182,7 +207,8 @@
       return {
         customer: readField(d, 'Customer Name'),
         internalId: readField(d, 'Customer Internal ID'),
-        address: readAddress(d),
+        address: readAddress(d, false),
+        permanent: readAddress(d, true),
         velocity: readField(d, 'Velocity Alert ID', true)
       };
     });
@@ -225,7 +251,11 @@
   }
 
   function tableRows() {
-    return results.map(function (r) { return [r.ecm, r.velocity, r.customer, r.internalId, r.address, r.file, r.result]; });
+    return results.map(function (r) {
+      var a = r.address || {};
+      return [r.ecm, r.velocity, r.customer, r.internalId, a.full, a.street, a.city, a.state, a.zip, a.country,
+        (r.permanent || {}).full, r.file, r.result];
+    });
   }
 
   function saveCsv() {
@@ -310,7 +340,7 @@
       line.textContent = tag + ' ' + result;
       results.push({
         ecm: id, velocity: info.velocity || '', customer: info.customer || '', internalId: info.internalId || '',
-        address: info.address || '',
+        address: info.address, permanent: info.permanent,
         file: result.indexOf('OK ') === 0 && result.indexOf('OK (') !== 0 ? result.slice(3) : '', result: result
       });
       if (result.indexOf('OK') === 0) ok++; else failed.push(id);
