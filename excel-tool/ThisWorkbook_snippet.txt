@@ -1,0 +1,6 @@
+' Paste into the ThisWorkbook code window (VBA editor: double-click "ThisWorkbook").
+' Restarts the ECM auto-import whenever you switch to the tool, in case Excel lost it.
+Private Sub Workbook_Activate()
+    On Error Resume Next
+    ECM_EnsureWatcher
+End Sub
