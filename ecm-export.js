@@ -302,22 +302,44 @@
   /* ---------- panel ---------- */
   var panel = document.createElement('div');
   panel.id = '__ecmExport';
-  panel.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:2147483647;width:340px;background:#1f2937;color:#fff;' +
-    'font:13px/1.4 Segoe UI,Arial,sans-serif;padding:10px 12px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.35)';
+  /* Every style is set inline and in full so the ECM page's own CSS cannot shift the layout. */
+  var FONT = 'font-family:Segoe UI,Arial,sans-serif;font-size:13px;line-height:1.4;letter-spacing:normal;text-transform:none;';
+  panel.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;width:360px;box-sizing:border-box;' +
+    'background:#1f2937;color:#f9fafb;padding:12px;border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.4);text-align:left;' + FONT;
   panel.innerHTML =
-    '<div style="font-weight:600;margin-bottom:6px">ECM Export Transactions</div>' +
-    '<textarea rows="6" style="width:100%;box-sizing:border-box;font:12px Consolas,monospace;color:#111" ' +
-    'placeholder="Alert IDs - one per line, or separated by commas/spaces"></textarea>' +
-    '<div class="row" style="margin:6px 0"></div>' +
-    '<div class="log" style="max-height:180px;overflow:auto;font:12px Consolas,monospace;white-space:pre-wrap"></div>';
+    '<div style="display:flex;align-items:center;justify-content:space-between;margin:0 0 8px;' + FONT + '">' +
+      '<span style="font-weight:600;font-size:14px">ECM Export Transactions</span>' +
+      '<span style="display:flex;align-items:center;gap:8px">' +
+        '<span class="count" style="font-size:12px;color:#9ca3af"></span>' +
+        '<button class="x" title="Close" style="all:unset;cursor:pointer;width:22px;height:22px;line-height:22px;text-align:center;' +
+          'border-radius:4px;color:#d1d5db;font:16px Arial,sans-serif">&#x2715;</button>' +
+      '</span>' +
+    '</div>' +
+    '<textarea rows="6" placeholder="Alert IDs - one per line, or separated by commas/spaces" style="display:block;width:100%;' +
+      'box-sizing:border-box;margin:0;padding:6px 8px;border:1px solid #4b5563;border-radius:6px;background:#f9fafb;color:#111827;' +
+      'font:13px/1.4 Consolas,monospace;resize:vertical"></textarea>' +
+    '<div class="row" style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:8px 0"></div>' +
+    '<div class="log" style="max-height:180px;overflow:auto;padding:6px 8px;border-radius:6px;background:#111827;color:#e5e7eb;' +
+      'font:12px/1.45 Consolas,monospace;white-space:pre-wrap;min-height:18px"></div>';
   var box = panel.querySelector('textarea');
   var row = panel.querySelector('.row');
   var logEl = panel.querySelector('.log');
+  var countEl = panel.querySelector('.count');
 
-  function btn(label, fn) {
+  function updateCount() {
+    var n = parseIds(box.value).length;
+    countEl.textContent = n ? n + (n === 1 ? ' ID' : ' IDs') : '';
+  }
+  box.addEventListener('input', updateCount);
+
+  function btn(label, fn, primary) {
     var b = document.createElement('button');
     b.textContent = label;
-    b.style.cssText = 'margin-right:4px;padding:3px 8px;border:0;border-radius:4px;cursor:pointer;background:#e5e7eb;color:#111';
+    b.style.cssText = 'all:unset;box-sizing:border-box;display:block;width:100%;height:30px;line-height:30px;text-align:center;' +
+      'border-radius:6px;cursor:pointer;font:13px Segoe UI,Arial,sans-serif;font-weight:' + (primary ? '600' : '400') + ';' +
+      (primary ? 'background:#2563eb;color:#fff;' : 'background:#e5e7eb;color:#111827;');
+    b.onmouseenter = function () { b.style.filter = 'brightness(0.92)'; };
+    b.onmouseleave = function () { b.style.filter = ''; };
     b.onclick = function (e) { e.preventDefault(); fn(); };
     row.appendChild(b);
     return b;
@@ -325,6 +347,7 @@
 
   function log(msg) {
     var line = document.createElement('div');
+    line.style.cssText = 'all:unset;display:block;font:inherit;line-height:inherit;color:inherit;white-space:pre-wrap';
     line.textContent = msg;
     logEl.appendChild(line);
     logEl.scrollTop = logEl.scrollHeight;
@@ -377,18 +400,19 @@
     running = false;
   }
 
-  btn('Start', run);
+  btn('Start', run, true);
   btn('Stop', function () { stopped = true; });
-  btn('Copy for Excel', copyForExcel);
   btn('Load my queue', function () {
     var ids = queueIds();
     box.value = ids.join('\n');
+    updateCount();
     log(ids.length ? 'Loaded ' + ids.length + ' IDs from My Case Queue.' : 'No queue found - open the Dashboard, or type IDs.');
   });
-  btn('Close', function () { stopped = true; panel.remove(); });
+  btn('Copy for Excel', copyForExcel);
+  panel.querySelector('.x').onclick = function (e) { e.preventDefault(); stopped = true; panel.remove(); };
 
   document.body.appendChild(panel);
   var initial = queueIds();
-  if (initial.length) { box.value = initial.join('\n'); log('Loaded ' + initial.length + ' IDs from My Case Queue. Remove any you do not want, then press Start.'); }
+  if (initial.length) { box.value = initial.join('\n'); updateCount(); log('Loaded ' + initial.length + ' IDs from My Case Queue. Remove any you do not want, then press Start.'); }
   box.focus();
 })();
