@@ -68,7 +68,7 @@ Option Explicit
 ' ==========================================================================
 
 Private Const PWD As String = "p7ss"
-Private Const ECM_IMPORT_VERSION As String = "2026-10-14e (auto narratives)"
+Private Const ECM_IMPORT_VERSION As String = "2026-10-14f (narratives + step log)"
 Private Const NOTIFY_WHEN_READY As Boolean = True ' on-top "case ready" message when a queued case loads
 ' On-top messages use the Windows MessageBox directly (VBA's MsgBox does not
 ' accept the "topmost" flag) - the same way the OSDD search prompts do, so the
@@ -384,6 +384,7 @@ End Function
 ' for the analyst. Only a failure shows a message.
 Private Sub LoadQueued(ByVal ws As Worksheet, ByVal csv As String, ByVal idx As Long, ByVal stillWaiting As Long)
     Dim ecmID As String, note As String, copied As String, result As String, cpNote As String
+    Dim osddNote As String, narrNote As String
 
     If LoadCsv(csv) <> "" Then Exit Sub
     ecmID = Field(mRows(idx), mCEcm)
@@ -414,16 +415,26 @@ Private Sub LoadQueued(ByVal ws As Worksheet, ByVal csv As String, ByVal idx As 
         result = RunAutoExport(ecmID, True)
         If result = "" Then result = "export did not finish (see its message)"
     End If
+    WriteLog ecmID, "step export: " & result
     If Left$(result, 2) = "OK" Then
         cpNote = FillCounterparties()
+        WriteLog ecmID, "step counterparties: " & FirstLine(cpNote)
         If AUTO_OSDD Then
             Application.StatusBar = "ECM " & ecmID & ": running OSDD search (Option 2)..."
-            cpNote = cpNote & vbCrLf & RunAutoOsdd()
+            WriteLog ecmID, "step OSDD: started"
+            osddNote = RunAutoOsdd()
+            cpNote = cpNote & vbCrLf & osddNote
+            WriteLog ecmID, "step OSDD: " & FirstLine(osddNote)
         End If
         If AUTO_NARRATIVES Then
             Application.StatusBar = "ECM " & ecmID & ": generating narratives..."
-            cpNote = cpNote & vbCrLf & RunAutoNarratives(ws)
+            WriteLog ecmID, "step narratives: started"
+            narrNote = RunAutoNarratives(ws)
+            cpNote = cpNote & vbCrLf & narrNote
+            WriteLog ecmID, "step narratives: " & Replace(Replace(narrNote, vbCrLf, " "), "   ", " ")
         End If
+    Else
+        WriteLog ecmID, "steps after the export skipped (export not OK)"
     End If
     GoTo Report
 
@@ -731,6 +742,21 @@ Private Function RunAutoOsdd() As String
         If i >= 7 Then out = out & "   ...": Exit For
     Next i
     RunAutoOsdd = "OSDD search (Option 2):" & vbCrLf & out
+End Function
+
+' Alt+F8 > ECM_Generate_Narratives: both narratives for the case now on Sheet1 -
+' the same step the queue runs, on its own, to check it.
+Public Sub ECM_Generate_Narratives()
+    Dim ws As Worksheet, msg As String
+    Set ws = ThisWorkbook.Sheets("Sheet1")
+    If Trim$(CStr(ws.Range("J9").Value)) = "" Then MsgBox "No case on Sheet1 (J9 is empty).", vbExclamation, "Narratives": Exit Sub
+    msg = RunAutoNarratives(ws)
+    WriteLog CStr(ws.Range("J9").Value), "manual narratives: " & Replace(msg, vbCrLf, " ")
+    MsgBox msg, vbInformation, "Narratives"
+End Sub
+
+Private Function FirstLine(ByVal s As String) As String
+    FirstLine = Split(Replace(s, vbCr, "") & vbLf, vbLf)(0)
 End Function
 
 ' Step 7: both narratives with the Wise template. For each decision: J5 = decision,
