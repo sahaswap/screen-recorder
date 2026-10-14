@@ -20,7 +20,9 @@ Option Explicit
 '   3. copies the alert's transaction file from Downloads into
 '      <Desktop>\<ECM>\Transaction Files;
 '   4. runs "Export Trx File" in AUTO_EXPORT_MODE (EN Network), no picker;
-'   5. samples the counterparties into J18:J23 / T18:T23 (modCPSample).
+'   5. samples the counterparties into J18:J23 / T18:T23 (modCPSample);
+'   6. runs the OSDD search with Option 2 (Module2 auto mode: name prompts take
+'      their defaults, Sigma "additional address" = No) - AUTO_OSDD.
 '
 ' Failsafe - nothing already made for a case is made again:
 '   - a Transaction Files folder that already has an Excel file is not copied into;
@@ -60,7 +62,7 @@ Option Explicit
 ' ==========================================================================
 
 Private Const PWD As String = "p7ss"
-Private Const ECM_IMPORT_VERSION As String = "2026-10-14b (counterparty sampling)"
+Private Const ECM_IMPORT_VERSION As String = "2026-10-14c (auto OSDD)"
 Private Const NOTIFY_WHEN_READY As Boolean = True ' on-top "case ready" message when a queued case loads
 ' On-top messages use the Windows MessageBox directly (VBA's MsgBox does not
 ' accept the "topmost" flag) - the same way the OSDD search prompts do, so the
@@ -72,8 +74,9 @@ Private Const MB_ICONINFO As Long = &H40
 Private Const MB_ON_TOP As Long = &H1000 Or &H10000 Or &H40000   ' system modal + set foreground + topmost
 Private Const MAX_LISTED As Long = 15
 Private Const AUTO_EXPORT_MODE As String = "EN"   ' "EN" / "LEGACY" / "PIVOT" / "" = do not export
+Private Const AUTO_OSDD As Boolean = True          ' run the OSDD search (Option 2) after sampling
 Private Const WATCH_SECONDS As Long = 10          ' how often Downloads is checked
-Private Const BUSY_TIMEOUT_MIN As Long = 5        ' a check running longer than this is treated as stuck
+Private Const BUSY_TIMEOUT_MIN As Long = 45       ' a check running longer than this is treated as stuck (OSDD can take a while)
 Private Const FILE_WAIT_SECONDS As Long = 120     ' how long to wait for a transaction file still downloading
 Private Const IMPORTED_FOLDER As String = "ECM_Imported"
 Private Const DONE_PREFIX As String = "Done_"
@@ -130,6 +133,7 @@ Public Sub Import_ECM_Info()
         If Left$(result, 2) = "OK" Then
             Dim cpNote As String
             cpNote = FillCounterparties()
+            If AUTO_OSDD Then cpNote = cpNote & vbCrLf & RunAutoOsdd()
             Application.StatusBar = Replace(Split(cpNote & vbCrLf, vbCrLf)(0), vbTab, " ")
         End If
         If result <> "OK" And Left$(result, 2) = "OK" Then
@@ -398,7 +402,13 @@ Private Sub LoadQueued(ByVal ws As Worksheet, ByVal csv As String, ByVal idx As 
         result = RunAutoExport(ecmID, True)
         If result = "" Then result = "export did not finish (see its message)"
     End If
-    If Left$(result, 2) = "OK" Then cpNote = FillCounterparties()
+    If Left$(result, 2) = "OK" Then
+        cpNote = FillCounterparties()
+        If AUTO_OSDD Then
+            Application.StatusBar = "ECM " & ecmID & ": running OSDD search (Option 2)..."
+            cpNote = cpNote & vbCrLf & RunAutoOsdd()
+        End If
+    End If
     GoTo Report
 
 Failed:
@@ -670,6 +680,35 @@ Fail:
     If Not wasOpen And Not wb Is Nothing Then wb.Close SaveChanges:=False
     ThisWorkbook.Protect Password:=PWD, Structure:=True
     Application.ScreenUpdating = prevUpd
+End Function
+
+' Step 6: the tool's OSDD search (Module2) in auto mode - Option 2, defaults for
+' every name prompt, Sigma = No, no start/success messages. Returns a short
+' summary for the "case ready" message. Never raises an error.
+Private Function RunAutoOsdd() As String
+    Dim lines() As String, i As Long, out As String
+    On Error Resume Next
+    ThisWorkbook.Activate
+    ThisWorkbook.Sheets("Sheet1").Activate
+    gOsddSummary = ""
+    gOsddAuto = True
+    SearchAndSavePDF_Direct
+    gOsddAuto = False
+    If Err.Number <> 0 Then
+        RunAutoOsdd = "OSDD search stopped with an error (" & Err.Number & ": " & Err.Description & ") - run it from the OSDD Search button."
+        Err.Clear
+        Exit Function
+    End If
+    If gOsddSummary = "" Then
+        RunAutoOsdd = "OSDD search did not finish - check its message, or run it from the OSDD Search button."
+        Exit Function
+    End If
+    lines = Split(Replace(gOsddSummary, vbCr, ""), vbLf)
+    For i = 0 To UBound(lines)
+        If Trim$(lines(i)) <> "" Then out = out & "   " & Trim$(lines(i)) & vbCrLf
+        If i >= 7 Then out = out & "   ...": Exit For
+    Next i
+    RunAutoOsdd = "OSDD search (Option 2):" & vbCrLf & out
 End Function
 
 ' Closes an open workbook by full path, without saving (it was just saved).
