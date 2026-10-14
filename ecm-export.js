@@ -13,10 +13,13 @@
 
   var BASE = location.origin + '/ECM/Case/Statistics.aspx?caseid=';
   var REQ_BASE = location.origin + '/ECM/Case/Requirements.aspx?caseid=';
+  /* Focal Entity info tab; the second address is tried if the first does not answer. */
+  var FOCAL_BASES = [location.origin + '/ECM/Case/CustomerInfo?caseid=', location.origin + '/ECM/Case/FocalEntity.aspx?caseid='];
   /* Off-screen but rendered: page text is only readable from a frame that is not hidden. */
   var FRAME_CSS = 'position:fixed;left:-10000px;top:0;width:1200px;height:800px;border:0;opacity:0;pointer-events:none';
   var COLUMNS = ['ECM ID', 'Velocity Alert ID', 'Customer Name', 'Customer Internal ID', 'Address',
-    'Street', 'City', 'State', 'Zip Code', 'Country', 'Permanent Address', 'Transaction File', 'Result'];
+    'Street', 'City', 'State', 'Zip Code', 'Country', 'Permanent Address',
+    'Program ID', 'Program Name', 'Program Description', 'Transaction File', 'Result'];
   var results = [];
   var BUTTON_ID = 'btnExportStatsTransactions';
   var CLICK_WAIT_MS = 10000; /* after clicking Export: time allowed for the download to start */
@@ -279,6 +282,54 @@
     return info.customer && info.velocity ? info : null;
   }
 
+  /* Focal Entity info page: "Customer Details" rows, each a label
+     (..._rptCustomerDetails_lblText_N, e.g. "ProgramDescription") and its value panel
+     (..._rptCustomerDetails_pnlControl<anything>_N). Fields are found by label text, not
+     by row number, since rows can differ between cases. Read from the raw HTML. */
+  async function readFocal(id) {
+    for (var b = 0; b < FOCAL_BASES.length; b++) {
+      var res = await fetch(FOCAL_BASES[b] + id, { credentials: 'same-origin' });
+      if (isLogin(res.url)) throw new Error('LOGIN');
+      if (!res.ok) continue;
+      var d = new DOMParser().parseFromString(await res.text(), 'text/html');
+      if (!d.querySelector('[id*="rptCustomerDetails_lblText_"]')) continue;
+      return {
+        programId: focalField(d, 'ProgramId'),
+        programName: focalField(d, 'ProgramName'),
+        programDescription: focalField(d, 'ProgramDescription')
+      };
+    }
+    return { error: 'Focal Entity info page not found' };
+  }
+
+  function focalField(d, label) {
+    var norm = function (t) { return (t || '').replace(/[\s:_]+/g, '').toLowerCase(); };
+    var labels = d.querySelectorAll('[id*="rptCustomerDetails_lblText_"]');
+    for (var i = 0; i < labels.length; i++) {
+      if (norm(labels[i].textContent) !== norm(label)) continue;
+      var n = /_(\d+)$/.exec(labels[i].id);
+      if (!n) continue;
+      var panel = null;
+      Array.prototype.some.call(d.querySelectorAll('[id*="rptCustomerDetails_pnlControl"]'), function (p) {
+        if (new RegExp('_' + n[1] + '$').test(p.id)) { panel = p; return true; }
+        return false;
+      });
+      if (!panel) return '';
+      var inp = panel.querySelector('input:not([type=hidden]):not([type=button]):not([type=submit]), select, textarea');
+      if (inp && inp.tagName === 'SELECT') {
+        var o = inp.querySelector('option[selected]');
+        return o ? clean(o.textContent) : '';
+      }
+      if (inp && inp.tagName === 'TEXTAREA') return clean(inp.textContent);
+      if (inp) return clean(inp.getAttribute('value') || '');
+      /* Text panel: "ProgramDescription: value" - drop the label part. */
+      var t = clean(panel.textContent);
+      var m = new RegExp('^\\s*' + label.split('').join('\\s*') + '\\s*:?\\s*', 'i').exec(t);
+      return clean(m ? t.slice(m[0].length) : t);
+    }
+    return '';
+  }
+
   async function readInfo(id) {
     var fast = await readInfoFast(id);
     if (fast) { fast.how = 'fast'; return fast; }
@@ -346,7 +397,7 @@
     return results.map(function (r) {
       var a = r.address || {};
       return [r.ecm, r.velocity, r.customer, r.internalId, a.full, a.street, a.city, a.state, a.zip, a.country,
-        (r.permanent || {}).full, r.file, r.result];
+        (r.permanent || {}).full, r.programId, r.programName, r.programDescription, r.file, r.result];
     });
   }
 
@@ -449,14 +500,16 @@
 
   /* One alert: details and export pages side by side. Returns a results row. */
   async function workAlert(id, line, tagStart) {
-    var tag = tagStart, info = {}, result, t0 = Date.now(), tInfo = 0, tExp = 0;
+    var tag = tagStart, info = {}, focal = {}, result, t0 = Date.now(), tInfo = 0, tExp = 0;
     try {
       var both = await Promise.all([
         readInfo(id).then(function (v) { tInfo = Date.now() - t0; return v; }),
-        getExport(id).then(function (v) { tExp = Date.now() - t0; return v; })
+        getExport(id).then(function (v) { tExp = Date.now() - t0; return v; }),
+        readFocal(id).catch(function (e) { if (e.message === 'LOGIN') throw e; return { error: e.message }; })
       ]);
       info = both[0];
       var ex = both[1];
+      focal = both[2] || {};
       if (info.error) tag += ' (details: ' + info.error + ')';
       else tag += ' ' + (info.velocity || '(no Velocity ID found)');
       if (ex.blob) {
@@ -475,6 +528,7 @@
     return {
       ecm: id, velocity: info.velocity || '', customer: info.customer || '', internalId: info.internalId || '',
       address: info.address, permanent: info.permanent,
+      programId: focal.programId || '', programName: focal.programName || '', programDescription: focal.programDescription || '',
       file: result.indexOf('OK ') === 0 && result.indexOf('OK (') !== 0 ? result.slice(3) : '', result: result
     };
   }
