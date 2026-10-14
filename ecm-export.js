@@ -23,7 +23,8 @@
   var PAUSE_MS = 300;      /* pause between alerts, to go easy on the server */
   var POLL_MS = 200;       /* how often a loading page is checked */
   var PAGE_TIMEOUT_MS = 60000;
-  var PARALLEL = 2;        /* alerts worked on at the same time (1 = one by one) */
+  var PARALLEL = 2;        /* default alerts worked on at the same time; the panel's picker overrides it */
+  try { PARALLEL = +localStorage.getItem('__ecmParallel') || PARALLEL; } catch (e) { /* storage blocked */ }
   var stopped = false;
   var running = false;
 
@@ -280,7 +281,10 @@
 
   async function readInfo(id) {
     var fast = await readInfoFast(id);
-    return fast || readInfoFrame(id);
+    if (fast) { fast.how = 'fast'; return fast; }
+    var full = await readInfoFrame(id);
+    if (full) full.how = 'full page';
+    return full;
   }
 
   function readInfoFrame(id) {
@@ -390,6 +394,14 @@
     '<textarea rows="6" placeholder="Alert IDs - one per line, or separated by commas/spaces" style="display:block;width:100%;' +
       'box-sizing:border-box;margin:0;padding:6px 8px;border:1px solid #4b5563;border-radius:6px;background:#f9fafb;color:#111827;' +
       'font:13px/1.4 Consolas,monospace;resize:vertical"></textarea>' +
+    '<div style="display:flex;align-items:center;gap:8px;margin:8px 0 0;' + FONT + 'font-size:12px;color:#d1d5db">' +
+      '<span>Alerts at a time:</span>' +
+      '<select class="__ecmPar" style="appearance:auto;-webkit-appearance:menulist;box-sizing:border-box;margin:0;' +
+        'width:56px;height:26px;padding:0 4px;border:1px solid #4b5563;border-radius:5px;background:#f9fafb;color:#111827;' +
+        'font:12px Segoe UI,Arial,sans-serif;line-height:normal;text-transform:none;cursor:pointer">' +
+        '<option value="1">1</option><option value="2">2</option><option value="3">3</option></select>' +
+      '<span style="color:#9ca3af">more = faster, more load on ECM</span>' +
+    '</div>' +
     '<div class="__ecmRow" style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:8px 0"></div>' +
     '<div class="__ecmLog" style="max-height:180px;overflow:auto;padding:6px 8px;border-radius:6px;background:#111827;color:#e5e7eb;' +
       'font:12px/1.45 Consolas,monospace;white-space:pre-wrap;min-height:18px"></div>';
@@ -397,6 +409,12 @@
   var row = panel.querySelector('.__ecmRow');
   var logEl = panel.querySelector('.__ecmLog');
   var countEl = panel.querySelector('.__ecmCount');
+  var parEl = panel.querySelector('.__ecmPar');
+  parEl.value = String(Math.min(3, Math.max(1, PARALLEL)));
+  parEl.onchange = function () {
+    PARALLEL = +parEl.value;
+    try { localStorage.setItem('__ecmParallel', String(PARALLEL)); } catch (e) { /* storage blocked */ }
+  };
 
   function updateCount() {
     var n = parseIds(box.value).length;
@@ -453,7 +471,7 @@
       result = 'error: ' + e.message;
     }
     line.textContent = tag + ' ' + result + '  (' + secs(Date.now() - t0) +
-      (tInfo && tExp ? ': details ' + secs(tInfo) + ', export ' + secs(tExp) : '') + ')';
+      (tInfo && tExp ? ': details ' + secs(tInfo) + (info.how ? ' (' + info.how + ')' : '') + ', export ' + secs(tExp) : '') + ')';
     return {
       ecm: id, velocity: info.velocity || '', customer: info.customer || '', internalId: info.internalId || '',
       address: info.address, permanent: info.permanent,
