@@ -302,7 +302,9 @@
   /* ---------- panel ---------- */
   var panel = document.createElement('div');
   panel.id = '__ecmExport';
-  /* Every style is set inline and in full so the ECM page's own CSS cannot shift the layout. */
+  /* Every style is set inline and in full, and class names are unique (the ECM page uses
+     Bootstrap, whose .row adds invisible ::before/::after items that would sit in the grid),
+     so the page's own CSS cannot shift the layout. */
   var FONT = 'font-family:Segoe UI,Arial,sans-serif;font-size:13px;line-height:1.4;letter-spacing:normal;text-transform:none;';
   panel.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;width:360px;box-sizing:border-box;' +
     'background:#1f2937;color:#f9fafb;padding:12px;border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.4);text-align:left;' + FONT;
@@ -310,21 +312,21 @@
     '<div style="display:flex;align-items:center;justify-content:space-between;margin:0 0 8px;' + FONT + '">' +
       '<span style="font-weight:600;font-size:14px">ECM Export Transactions</span>' +
       '<span style="display:flex;align-items:center;gap:8px">' +
-        '<span class="count" style="font-size:12px;color:#9ca3af"></span>' +
-        '<button class="x" title="Close" style="all:unset;cursor:pointer;width:22px;height:22px;line-height:22px;text-align:center;' +
+        '<span class="__ecmCount" style="font-size:12px;color:#9ca3af"></span>' +
+        '<button class="__ecmClose" title="Close" style="all:unset;cursor:pointer;width:22px;height:22px;line-height:22px;text-align:center;' +
           'border-radius:4px;color:#d1d5db;font:16px Arial,sans-serif">&#x2715;</button>' +
       '</span>' +
     '</div>' +
     '<textarea rows="6" placeholder="Alert IDs - one per line, or separated by commas/spaces" style="display:block;width:100%;' +
       'box-sizing:border-box;margin:0;padding:6px 8px;border:1px solid #4b5563;border-radius:6px;background:#f9fafb;color:#111827;' +
       'font:13px/1.4 Consolas,monospace;resize:vertical"></textarea>' +
-    '<div class="row" style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:8px 0"></div>' +
-    '<div class="log" style="max-height:180px;overflow:auto;padding:6px 8px;border-radius:6px;background:#111827;color:#e5e7eb;' +
+    '<div class="__ecmRow" style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:8px 0"></div>' +
+    '<div class="__ecmLog" style="max-height:180px;overflow:auto;padding:6px 8px;border-radius:6px;background:#111827;color:#e5e7eb;' +
       'font:12px/1.45 Consolas,monospace;white-space:pre-wrap;min-height:18px"></div>';
   var box = panel.querySelector('textarea');
-  var row = panel.querySelector('.row');
-  var logEl = panel.querySelector('.log');
-  var countEl = panel.querySelector('.count');
+  var row = panel.querySelector('.__ecmRow');
+  var logEl = panel.querySelector('.__ecmLog');
+  var countEl = panel.querySelector('.__ecmCount');
 
   function updateCount() {
     var n = parseIds(box.value).length;
@@ -332,10 +334,11 @@
   }
   box.addEventListener('input', updateCount);
 
-  function btn(label, fn, primary) {
+  function btn(label, fn, primary, wide) {
     var b = document.createElement('button');
     b.textContent = label;
     b.style.cssText = 'all:unset;box-sizing:border-box;display:block;width:100%;height:30px;line-height:30px;text-align:center;' +
+      (wide ? 'grid-column:1 / span 2;' : '') +
       'border-radius:6px;cursor:pointer;font:13px Segoe UI,Arial,sans-serif;font-weight:' + (primary ? '600' : '400') + ';' +
       (primary ? 'background:#2563eb;color:#fff;' : 'background:#e5e7eb;color:#111827;');
     b.onmouseenter = function () { b.style.filter = 'brightness(0.92)'; };
@@ -408,8 +411,15 @@
     updateCount();
     log(ids.length ? 'Loaded ' + ids.length + ' IDs from My Case Queue.' : 'No queue found - open the Dashboard, or type IDs.');
   });
-  btn('Copy for Excel', copyForExcel);
-  panel.querySelector('.x').onclick = function (e) { e.preventDefault(); stopped = true; panel.remove(); };
+  btn('Clear', function () {
+    if (running) { log('Export is running - press Stop first.'); return; }
+    box.value = '';
+    logEl.textContent = '';
+    updateCount();
+    box.focus();
+  });
+  btn('Copy for Excel', copyForExcel, false, true);
+  panel.querySelector('.__ecmClose').onclick = function (e) { e.preventDefault(); stopped = true; panel.remove(); };
 
   document.body.appendChild(panel);
   var initial = queueIds();
