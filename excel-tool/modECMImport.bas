@@ -25,7 +25,10 @@ Option Explicit
 '   4. runs "Export Trx File" in AUTO_EXPORT_MODE (EN Network), no picker;
 '   5. samples the counterparties into J18:J23 / T18:T23 (modCPSample);
 '   6. runs the OSDD search with Option 2 (Module2 auto mode: name prompts take
-'      their defaults, Sigma "additional address" = No) - AUTO_OSDD.
+'      their defaults, Sigma "additional address" = No) - AUTO_OSDD;
+'   7. generates both narratives with the Wise template - Escalation, then
+'      Non-Escalation (Module3 quiet mode) - AUTO_NARRATIVES. Decision/Template
+'      are cleared afterwards so the analyst still makes the call; J7 is kept.
 '
 ' Failsafe - nothing already made for a case is made again:
 '   - a Transaction Files folder that already has an Excel file is not copied into;
@@ -65,7 +68,7 @@ Option Explicit
 ' ==========================================================================
 
 Private Const PWD As String = "p7ss"
-Private Const ECM_IMPORT_VERSION As String = "2026-10-14d (program name)"
+Private Const ECM_IMPORT_VERSION As String = "2026-10-14e (auto narratives)"
 Private Const NOTIFY_WHEN_READY As Boolean = True ' on-top "case ready" message when a queued case loads
 ' On-top messages use the Windows MessageBox directly (VBA's MsgBox does not
 ' accept the "topmost" flag) - the same way the OSDD search prompts do, so the
@@ -78,6 +81,8 @@ Private Const MB_ON_TOP As Long = &H1000 Or &H10000 Or &H40000   ' system modal 
 Private Const MAX_LISTED As Long = 15
 Private Const AUTO_EXPORT_MODE As String = "EN"   ' "EN" / "LEGACY" / "PIVOT" / "" = do not export
 Private Const AUTO_OSDD As Boolean = True          ' run the OSDD search (Option 2) after sampling
+Private Const AUTO_NARRATIVES As Boolean = True    ' generate the Escalation and Non-Escalation narratives
+Private Const NARR_TEMPLATE As String = "Wise"     ' template (J6) used for both narratives
 Private Const WATCH_SECONDS As Long = 10          ' how often Downloads is checked
 Private Const BUSY_TIMEOUT_MIN As Long = 45       ' a check running longer than this is treated as stuck (OSDD can take a while)
 Private Const FILE_WAIT_SECONDS As Long = 120     ' how long to wait for a transaction file still downloading
@@ -140,6 +145,7 @@ Public Sub Import_ECM_Info()
             Dim cpNote As String
             cpNote = FillCounterparties()
             If AUTO_OSDD Then cpNote = cpNote & vbCrLf & RunAutoOsdd()
+            If AUTO_NARRATIVES Then cpNote = cpNote & vbCrLf & RunAutoNarratives(ws)
             Application.StatusBar = Replace(Split(cpNote & vbCrLf, vbCrLf)(0), vbTab, " ")
         End If
         If result <> "OK" And Left$(result, 2) = "OK" Then
@@ -413,6 +419,10 @@ Private Sub LoadQueued(ByVal ws As Worksheet, ByVal csv As String, ByVal idx As 
         If AUTO_OSDD Then
             Application.StatusBar = "ECM " & ecmID & ": running OSDD search (Option 2)..."
             cpNote = cpNote & vbCrLf & RunAutoOsdd()
+        End If
+        If AUTO_NARRATIVES Then
+            Application.StatusBar = "ECM " & ecmID & ": generating narratives..."
+            cpNote = cpNote & vbCrLf & RunAutoNarratives(ws)
         End If
     End If
     GoTo Report
@@ -722,6 +732,51 @@ Private Function RunAutoOsdd() As String
     Next i
     RunAutoOsdd = "OSDD search (Option 2):" & vbCrLf & out
 End Function
+
+' Step 7: both narratives with the Wise template. For each decision: J5 = decision,
+' J6 = template, then J7 is written again - Sheet1 clears J7 whenever J5 changes -
+' recalculate, and run Generate Narrative (Module3 ExportToWord) quietly. The files
+' are the tool's usual "..._Escalation Narrative.docx" and "..._Alert Write-Up.docx"
+' in Desktop\<ECM>. Afterwards J5/J6 are cleared (the decision stays with the
+' analyst) and J7 is restored. Never raises an error.
+Private Function RunAutoNarratives(ByVal ws As Worksheet) As String
+    Dim prog As String, d As Variant, out As String, f As String
+    On Error GoTo Fail
+    prog = CStr(ws.Range("J7").Value)
+    For Each d In Array("Escalation", "Non-Escalation")
+        Application.EnableEvents = True
+        PutValue ws, "J5", CStr(d)
+        PutValue ws, "J6", NARR_TEMPLATE
+        If prog <> "" Then PutValue ws, "J7", prog
+        ProtectSheet ws
+        Application.CalculateFull
+        gNarrLastFile = ""
+        gNarrQuiet = True
+        ExportToWord
+        gNarrQuiet = False
+        f = gNarrLastFile
+        out = out & "   " & d & ": " & IIf(f <> "", Mid$(f, InStrRev(f, "\") + 1), "not saved - see its message") & vbCrLf
+    Next d
+    RestoreDecision ws, prog
+    RunAutoNarratives = "Narratives (" & NARR_TEMPLATE & " template" & IIf(prog = "", ", NO program name - check [Program Description]", "") & "):" & vbCrLf & out
+    Exit Function
+
+Fail:
+    RunAutoNarratives = "Narratives stopped with an error (" & Err.Number & ": " & Err.Description & ") - " & _
+                        "use Generate Narrative." & vbCrLf & out
+    gNarrQuiet = False
+    RestoreDecision ws, prog
+End Function
+
+' After the narratives: Decision and Template cleared, Program Name put back.
+Private Sub RestoreDecision(ByVal ws As Worksheet, ByVal prog As String)
+    On Error Resume Next
+    PutValue ws, "J5", ""
+    PutValue ws, "J6", ""
+    If prog <> "" Then PutValue ws, "J7", prog
+    ProtectSheet ws
+    Application.CalculateFull
+End Sub
 
 ' Closes an open workbook by full path, without saving (it was just saved).
 Public Sub CloseSavedExport(ByVal fullPath As String)
