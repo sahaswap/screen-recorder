@@ -11,6 +11,9 @@ Option Explicit
 '        J10 = Alert ID           <- Velocity Alert ID
 '        J13 = Customer Name      <- Customer Name
 '        J14 = Customer Address   <- Address (street, city, state zip, country)
+'        J7  = Program Name       <- ECM Focal Entity "ProgramDescription" (the program
+'                                    manager) matched to Program_Library!A1:A97 - see
+'                                    MatchProgram; ProgramName is tried if it does not match
 '        L27 = ISO Code 2         <- country code of the address; Sheet1's own
 '                                    change handler fills G27 / O27 and the risk
 '                                    formulas follow (filled here if it does not)
@@ -62,7 +65,7 @@ Option Explicit
 ' ==========================================================================
 
 Private Const PWD As String = "p7ss"
-Private Const ECM_IMPORT_VERSION As String = "2026-10-14c (auto OSDD)"
+Private Const ECM_IMPORT_VERSION As String = "2026-10-14d (program name)"
 Private Const NOTIFY_WHEN_READY As Boolean = True ' on-top "case ready" message when a queued case loads
 ' On-top messages use the Windows MessageBox directly (VBA's MsgBox does not
 ' accept the "topmost" flag) - the same way the OSDD search prompts do, so the
@@ -85,6 +88,8 @@ Private Const LOG_NAME As String = "ECM_import_log.txt"
 ' Loaded csv
 Private mRows As Collection
 Private mCEcm As Long, mCVel As Long, mCCust As Long, mCAddr As Long, mCCountry As Long, mCFile As Long
+Private mCProgDesc As Long, mCProgName As Long
+Private mProgramNote As String      ' last import's program line, for the "case ready" message
 
 ' Watcher state
 Private mWatching As Boolean
@@ -426,6 +431,7 @@ Report:
         If NOTIFY_WHEN_READY Then
             TopMessage "ECM case " & ecmID & " is ready in the tool." & vbCrLf & _
                        IIf(stillWaiting > 0, stillWaiting & " more waiting after this one.", "No more alerts waiting.") & vbCrLf & vbCrLf & _
+                       IIf(mProgramNote <> "", mProgramNote & vbCrLf & vbCrLf, "") & _
                        IIf(cpNote <> "", cpNote & vbCrLf, "") & _
                        "Click OK to work it.", "ECM case ready", MB_ICONINFO
         End If
@@ -536,6 +542,8 @@ Private Function LoadCsv(ByVal csvPath As String) As String
     mCAddr = ColIdx(mRows(1), "Address")
     mCCountry = ColIdx(mRows(1), "Country")
     mCFile = ColIdx(mRows(1), "Transaction File")
+    mCProgDesc = ColIdx(mRows(1), "Program Description")
+    mCProgName = ColIdx(mRows(1), "Program Name")
     If mCEcm < 0 Then LoadCsv = "This does not look like an ECM export file (no 'ECM ID' column):" & vbCrLf & csvPath
 End Function
 
@@ -562,6 +570,7 @@ Private Function ImportRow(ByVal ws As Worksheet, ByVal idx As Long, ByVal csvPa
             PutValue ws, "J" & r, ""
             PutValue ws, "T" & r, ""
         Next r
+        PutValue ws, "J7", ""
     End If
     PutValue ws, "J13", ""
     PutValue ws, "J14", ""
@@ -573,6 +582,7 @@ Private Function ImportRow(ByVal ws As Worksheet, ByVal idx As Long, ByVal csvPa
     PutValue ws, "J10", velID
     If custName <> "" Then PutValue ws, "J13", custName
     If addr <> "" Then PutValue ws, "J14", addr
+    mProgramNote = FillProgram(ws, Field(rec, mCProgDesc), Field(rec, mCProgName))
     If iso2 <> "" Then
         PutValue ws, "L27", iso2
         ' Sheet1's handler normally fills G27/O27 from L27; fill them here if it did not.
@@ -583,7 +593,8 @@ Private Function ImportRow(ByVal ws As Worksheet, ByVal idx As Long, ByVal csvPa
     note = "Filled Sheet1 for ECM case " & ecmID & ":" & vbCrLf & _
            "   ECM Case (J9), Alert ID (J10)" & _
            IIf(custName <> "", ", Customer Name (J13)", "") & _
-           IIf(addr <> "", ", Customer Address (J14)", "") & vbCrLf
+           IIf(addr <> "", ", Customer Address (J14)", "") & vbCrLf & _
+           IIf(mProgramNote <> "", "   " & mProgramNote & vbCrLf, "")
     If iso2 <> "" Then
         If Trim$(CStr(ws.Range("G27").Value)) <> "" Then
             note = note & "   Country (G27): " & ws.Range("G27").Value & vbCrLf
@@ -851,6 +862,108 @@ Private Function ExportModeName(ByVal mode As String) As String
         Case "PIVOT": ExportModeName = "Pivot Analysis"
         Case Else: ExportModeName = "Legacy"
     End Select
+End Function
+
+' ---- Program Name (J7) ----------------------------------------------------
+' Writes the Program_Library name matching ECM's ProgramDescription (or, failing
+' that, ProgramName) into J7, exactly as the library spells it so J7's dropdown
+' accepts it. Leaves J7 alone when nothing matches. Returns a one-line note.
+Private Function FillProgram(ByVal ws As Worksheet, ByVal progDesc As String, ByVal progName As String) As String
+    Dim hit As String, src As String
+    On Error GoTo Fail
+    If progDesc = "" And progName = "" Then Exit Function
+    hit = MatchProgram(progDesc): src = progDesc
+    If hit = "" Then hit = MatchProgram(progName): src = progName
+    If hit = "" Then
+        FillProgram = "Program: '" & IIf(progDesc <> "", progDesc, progName) & _
+                      "' is not in Program_Library - pick Program Name (J7) yourself."
+        Exit Function
+    End If
+    PutValue ws, "J7", hit
+    FillProgram = "Program Name (J7): " & Trim$(hit) & IIf(NormName(src) <> NormName(hit), "  (ECM: " & src & ")", "")
+    Exit Function
+Fail:
+    FillProgram = "Program: could not fill J7 (" & Err.Description & ")."
+End Function
+
+' Best Program_Library!A1:A97 entry for an ECM program value, or "".
+'   1. same name, ignoring case, spaces, punctuation and legal endings (Inc, Ltd, ...);
+'   2. same as one of the entry's alternative names - the parts in brackets or
+'      split by "/" (e.g. "Pomelo (Lemonade/LemFi)" also answers to LemFi);
+'   3. otherwise the LONGEST entry (or alternative) that the value starts with, or
+'      that starts with the value, as whole words - "Airwallex Hong Kong Limited"
+'      picks "Airwallex Hong Kong Ltd" over "Airwallex".
+Private Function MatchProgram(ByVal v As String) As String
+    Dim lib As Range, c As Range, alts As Variant, a As Variant, nv As String, na As String
+    Dim bestLen As Long, best As String
+    nv = NormName(v)
+    If nv = "" Then Exit Function
+    On Error Resume Next
+    Set lib = ThisWorkbook.Sheets("Program_Library").Range("A1:A97")
+    On Error GoTo 0
+    If lib Is Nothing Then Exit Function
+
+    For Each c In lib.Cells                                   ' 1. exact
+        If Trim$(CStr(c.Value)) <> "" Then
+            If NormName(CStr(c.Value)) = nv Then MatchProgram = CStr(c.Value): Exit Function
+        End If
+    Next c
+    For Each c In lib.Cells                                   ' 2. alternative names
+        If Trim$(CStr(c.Value)) <> "" Then
+            alts = AltNames(CStr(c.Value))
+            For Each a In alts
+                If NormName(CStr(a)) = nv And NormName(CStr(a)) <> "" Then MatchProgram = CStr(c.Value): Exit Function
+            Next a
+        End If
+    Next c
+    For Each c In lib.Cells                                   ' 3. longest whole-word prefix
+        If Trim$(CStr(c.Value)) <> "" Then
+            alts = AltNames(CStr(c.Value))
+            For Each a In alts
+                na = NormName(CStr(a))
+                If Len(na) >= 3 Then
+                    If (nv & " ") Like (na & " *") Or (na & " ") Like (nv & " *") Then
+                        If Len(na) > bestLen Then bestLen = Len(na): best = CStr(c.Value)
+                    End If
+                End If
+            Next a
+        End If
+    Next c
+    MatchProgram = best
+End Function
+
+' The full name plus the parts in brackets / split by "/".
+Private Function AltNames(ByVal full As String) As Variant
+    Dim parts As String, p As Long, q As Long, outside As String, inside As String
+    p = InStr(full, "(")
+    If p > 0 Then
+        q = InStr(p, full, ")")
+        If q = 0 Then q = Len(full) + 1
+        outside = Left$(full, p - 1) & " " & Mid$(full, q + 1)
+        inside = Mid$(full, p + 1, q - p - 1)
+    Else
+        outside = full
+    End If
+    parts = full & "|" & Replace(outside, "/", "|") & "|" & Replace(inside, "/", "|")
+    AltNames = Split(parts, "|")
+End Function
+
+' Lower case, letters and digits only (single spaces), legal endings removed.
+Private Function NormName(ByVal s As String) As String
+    Dim i As Long, ch As String, out As String, w As Variant, words As String
+    s = LCase$(s)
+    For i = 1 To Len(s)
+        ch = Mid$(s, i, 1)
+        If ch Like "[a-z0-9]" Then out = out & ch Else out = out & " "
+    Next i
+    For Each w In Split(Application.WorksheetFunction.Trim(out), " ")
+        Select Case w
+            Case "inc", "ltd", "llc", "corp", "corporation", "co", "pte", "limited", "plc", "gmbh", "sa", "ag", "bv", "lp", "llp", "the"
+            Case Else
+                If w <> "" Then words = words & " " & w
+        End Select
+    Next w
+    NormName = Trim$(words)
 End Function
 
 ' "US - United States" -> "US"; a bare 2-letter code is returned as is.
