@@ -29,8 +29,9 @@ Option Explicit
 ' one that is only a country (e.g. "US") is left blank and reported.
 '
 ' Names written to J18:J23 are cleaned for file names and merging (CleanCpName):
-' "&" -> "and", characters Windows forbids in file names -> space, other
-' punctuation removed, spaces collapsed. Two names that clean to the same text
+' characters Windows forbids in file names -> space, other punctuation removed
+' ("&" is kept - the tool's file-name, search and merge code all handle it),
+' spaces collapsed. Two names that clean to the same text
 ' count as one counterparty. Amounts and addresses still use ECM's spelling.
 '
 ' Never overwrites: if J18:J23 already has any name, nothing is written.
@@ -225,15 +226,14 @@ Private Function CounterpartyAddress(ByVal cd As Worksheet, ByVal lastRow As Lon
     CounterpartyAddress = best
 End Function
 
-' Counterparty name safe for file names, PDF merging and searches: "&" -> "and",
-' characters Windows forbids in file names -> space, other punctuation removed,
-' letters (accented too), digits, spaces and hyphens kept; spaces collapsed.
+' Counterparty name safe for file names, PDF merging and searches: characters
+' Windows forbids in file names -> space, other punctuation removed; letters
+' (accented too), digits, spaces, hyphens and "&" kept; spaces collapsed.
 Public Function CleanCpName(ByVal s As String) As String
     Dim i As Long, ch As String, out As String
-    s = Replace(s, "&", " and ")
     For i = 1 To Len(s)
         ch = Mid$(s, i, 1)
-        If ch Like "[A-Za-z0-9-]" Or ch = " " Then
+        If ch Like "[A-Za-z0-9-]" Or ch = " " Or ch = "&" Then
             out = out & ch
         ElseIf AscW(ch) >= 192 And (UCase$(ch) <> LCase$(ch) Or AscW(ch) >= 12288) Then
             out = out & ch                           ' accented letters, CJK - not curly quotes or symbols
