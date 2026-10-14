@@ -23,6 +23,7 @@
   var PAUSE_MS = 300;      /* pause between alerts, to go easy on the server */
   var POLL_MS = 200;       /* how often a loading page is checked */
   var PAGE_TIMEOUT_MS = 60000;
+  var PARALLEL = 2;        /* alerts worked on at the same time (1 = one by one) */
   var stopped = false;
   var running = false;
 
@@ -92,6 +93,8 @@
   }
 
   function isLogin(url) { return /\/Login/i.test(url); }
+
+  function clean(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
 
   function safeName(s) { return (s || '').replace(/[\\\/:*?"<>|\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60); }
 
@@ -213,7 +216,74 @@
     for (var waited = 0; d.readyState !== 'complete' && waited < PAGE_TIMEOUT_MS; waited += POLL_MS) await sleep(POLL_MS);
   }
 
-  function readInfo(id) {
+  /* Fast path: fetch the Requirements page as plain HTML (no scripts, styles or frames)
+     and read the fields by ECM's own element ids. Returns null when something needed is
+     not in the raw HTML - the caller then falls back to the full-page readInfoFrame. */
+  async function readInfoFast(id) {
+    var res = await fetch(REQ_BASE + id, { credentials: 'same-origin' });
+    if (isLogin(res.url)) throw new Error('LOGIN');
+    if (!res.ok) return null;
+    var d = new DOMParser().parseFromString(await res.text(), 'text/html');
+
+    /* Header lines written as "Label: value" (Customer Name, Customer Internal ID). */
+    function header(label) {
+      var rx = new RegExp('^\\s*' + label + '\\s*:\\s*([^\\n]*)', 'i'), best = null;
+      Array.prototype.forEach.call(d.querySelectorAll('div,span,td,th,label,b,strong,p,li'), function (el) {
+        var t = el.textContent.replace(/\s+/g, ' ').trim();
+        if (t.length < 200 && rx.test(t)) best = el;   /* last match = innermost element */
+      });
+      if (!best) return '';
+      return clean(best.textContent.replace(/\s+/g, ' ').trim().replace(new RegExp('^\\s*' + label + '\\s*:\\s*', 'i'), ''));
+    }
+    /* Requirement rows: <... id="..._ReqLabel_N">Label:</...> and the value in "..._divSoureField_N". */
+    function req(label) {
+      var rx = new RegExp('^\\s*' + label + '\\s*:?\\s*\\*?\\s*$', 'i');
+      var labels = d.querySelectorAll('[id*="ReqLabel_"]');
+      for (var i = 0; i < labels.length; i++) {
+        if (!rx.test(labels[i].textContent)) continue;
+        var m = /^(.*)ReqLabel_(\d+)$/.exec(labels[i].id);
+        if (!m) continue;
+        var field = d.getElementById(m[1] + 'divSoureField_' + m[2]);
+        if (!field) return '';
+        var inp = field.querySelector('input:not([type=hidden]):not([type=button]):not([type=submit]):not([type=checkbox]):not([type=radio]), select, textarea');
+        if (inp && inp.tagName === 'SELECT') {
+          var o = inp.querySelector('option[selected]');
+          return o && o.value !== '' && !/^\s*(--|select\b)/i.test(o.textContent) ? clean(o.textContent) : '';
+        }
+        if (inp && inp.tagName === 'TEXTAREA') return clean(inp.textContent);
+        if (inp) return clean(inp.getAttribute('value') || '');
+        return clean(field.textContent);
+      }
+      return '';
+    }
+    function addr(permanent) {
+      var p = permanent ? 'Permanent ' : '';
+      var a = {
+        street: req(permanent ? 'Permanent Address' : 'Street Address') || (permanent ? req('Permanent Street Address') : ''),
+        city: req(p + 'City'), state: req(p + 'State'),
+        zip: req(p + 'Zip Code') || req(p + 'Zip') || req(p + 'Postal Code'),
+        country: req(p + 'Country')
+      };
+      a.full = [a.street, a.city, [shortCode(a.state), a.zip].filter(Boolean).join(' '), shortCode(a.country)].filter(Boolean).join(', ');
+      return a;
+    }
+
+    var info = {
+      customer: header('Customer Name'),
+      internalId: header('Customer Internal ID'),
+      velocity: req('Velocity Alert ID'),
+      address: addr(false),
+      permanent: addr(true)
+    };
+    return info.customer && info.velocity ? info : null;
+  }
+
+  async function readInfo(id) {
+    var fast = await readInfoFast(id);
+    return fast || readInfoFrame(id);
+  }
+
+  function readInfoFrame(id) {
     return withFrame(REQ_BASE + id, function (d) {
       return d.body && stylesLoaded(d) && /Customer Name/i.test(d.body.innerText) ? true : null;
     }, function (d, why) {
@@ -357,47 +427,74 @@
     return line;
   }
 
+  function secs(ms) { return (ms / 1000).toFixed(1) + ' s'; }
+
+  /* One alert: details and export pages side by side. Returns a results row. */
+  async function workAlert(id, line, tagStart) {
+    var tag = tagStart, info = {}, result, t0 = Date.now(), tInfo = 0, tExp = 0;
+    try {
+      var both = await Promise.all([
+        readInfo(id).then(function (v) { tInfo = Date.now() - t0; return v; }),
+        getExport(id).then(function (v) { tExp = Date.now() - t0; return v; })
+      ]);
+      info = both[0];
+      var ex = both[1];
+      if (info.error) tag += ' (details: ' + info.error + ')';
+      else tag += ' ' + (info.velocity || '(no Velocity ID found)');
+      if (ex.blob) {
+        var name = fileName(ex.disp, ex.type, info.velocity ? id + '_' + safeName(info.velocity) : id);
+        saveBlob(ex.blob, name);
+        result = 'OK ' + name;
+      } else {
+        result = ex.result;
+      }
+    } catch (e) {
+      if (e.message === 'LOGIN') throw e;
+      result = 'error: ' + e.message;
+    }
+    line.textContent = tag + ' ' + result + '  (' + secs(Date.now() - t0) +
+      (tInfo && tExp ? ': details ' + secs(tInfo) + ', export ' + secs(tExp) : '') + ')';
+    return {
+      ecm: id, velocity: info.velocity || '', customer: info.customer || '', internalId: info.internalId || '',
+      address: info.address, permanent: info.permanent,
+      file: result.indexOf('OK ') === 0 && result.indexOf('OK (') !== 0 ? result.slice(3) : '', result: result
+    };
+  }
+
   async function run() {
     if (running) return;
     var ids = parseIds(box.value);
     if (!ids.length) { log('Enter at least one alert ID.'); return; }
     running = true; stopped = false;
     logEl.textContent = '';
-    results = [];
-    var ok = 0, failed = [];
-    for (var i = 0; i < ids.length && !stopped; i++) {
-      var id = ids[i];
-      var tag = '[' + (i + 1) + '/' + ids.length + '] ' + id;
-      var line = log(tag + ' working ...');
-      var info = {}, result, started = Date.now();
-      try {
-        /* Details and export pages load side by side. */
-        var both = await Promise.all([readInfo(id), getExport(id)]);
-        info = both[0];
-        var ex = both[1];
-        if (info.error) tag += ' (details: ' + info.error + ')';
-        else tag += ' ' + (info.velocity || '(no Velocity ID found)');
-        if (ex.blob) {
-          var name = fileName(ex.disp, ex.type, info.velocity ? id + '_' + safeName(info.velocity) : id);
-          saveBlob(ex.blob, name);
-          result = 'OK ' + name;
-        } else {
-          result = ex.result;
+    var rows = new Array(ids.length), next = 0, loggedOut = false, t0 = Date.now();
+
+    /* PARALLEL workers each take the next alert until none are left. */
+    async function worker() {
+      while (!stopped && !loggedOut && next < ids.length) {
+        var i = next++;
+        var tag = '[' + (i + 1) + '/' + ids.length + '] ' + ids[i];
+        var line = log(tag + ' working ...');
+        try {
+          rows[i] = await workAlert(ids[i], line, tag);
+        } catch (e) {
+          loggedOut = true;
+          line.textContent = tag + ' session expired';
+          return;
         }
-      } catch (e) {
-        if (e.message === 'LOGIN') { line.textContent = tag + ' session expired'; log('Log in to ECM again, then press Start.'); break; }
-        result = 'error: ' + e.message;
+        await sleep(PAUSE_MS);
       }
-      line.textContent = tag + ' ' + result + '  (' + ((Date.now() - started) / 1000).toFixed(1) + ' s)';
-      results.push({
-        ecm: id, velocity: info.velocity || '', customer: info.customer || '', internalId: info.internalId || '',
-        address: info.address, permanent: info.permanent,
-        file: result.indexOf('OK ') === 0 && result.indexOf('OK (') !== 0 ? result.slice(3) : '', result: result
-      });
-      if (result.indexOf('OK') === 0) ok++; else failed.push(id);
-      await sleep(PAUSE_MS);
     }
-    log((stopped ? 'Stopped. ' : 'Finished. ') + ok + ' exported' + (failed.length ? ', failed: ' + failed.join(', ') : '.'));
+    var workers = [];
+    for (var w = 0; w < Math.max(1, PARALLEL); w++) workers.push(worker());
+    await Promise.all(workers);
+
+    results = rows.filter(Boolean);
+    var ok = results.filter(function (r) { return r.result.indexOf('OK') === 0; }).length;
+    var failed = results.filter(function (r) { return r.result.indexOf('OK') !== 0; }).map(function (r) { return r.ecm; });
+    if (loggedOut) log('Log in to ECM again, then press Start.');
+    log((stopped || loggedOut ? 'Stopped. ' : 'Finished. ') + ok + ' exported' +
+        (failed.length ? ', failed: ' + failed.join(', ') : '.') + '  Total ' + secs(Date.now() - t0) + '.');
     saveCsv();
     if (results.length) log('Saved ECM_Alert_Info CSV to Downloads. "Copy for Excel" copies the same table.');
     running = false;
