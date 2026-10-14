@@ -28,6 +28,11 @@ Option Explicit
 ' Counterparty column itself is built with). The most frequent address is used;
 ' one that is only a country (e.g. "US") is left blank and reported.
 '
+' Names written to J18:J23 are cleaned for file names and merging (CleanCpName):
+' "&" -> "and", characters Windows forbids in file names -> space, other
+' punctuation removed, spaces collapsed. Two names that clean to the same text
+' count as one counterparty. Amounts and addresses still use ECM's spelling.
+'
 ' Never overwrites: if J18:J23 already has any name, nothing is written.
 ' Run it on its own with Alt+F8 > Sample_Counterparties.
 ' ==========================================================================
@@ -51,7 +56,7 @@ Public Function FillCounterparties() As String
     Dim lastRow As Long, r As Long, i As Long, j As Long
     Dim rule As String, cp As String, amt As Double, key As Variant
     Dim pairVal As Object, ruleTop As Object, blankTop As Object, rules As Collection
-    Dim picks As New Collection, pickRule As New Collection, picked As Object
+    Dim picks As New Collection, pickRule As New Collection, picked As Object, origs As New Collection, cpClean As String
     Dim keys() As String, vals() As Double, n As Long, tmpS As String, tmpD As Double
     Dim note As String, addrNote As String, addr As String
 
@@ -125,10 +130,13 @@ Public Function FillCounterparties() As String
     For i = 1 To n                                   ' highest value first, so the first
         rule = Split(keys(i), vbTab)(0)              ' unpicked pair of a rule is its top
         cp = Split(keys(i), vbTab)(1)
-        If Not ruleTop.Exists(rule) And Not picked.Exists(cp) And picks.Count < MAX_PICKS Then
-            ruleTop(rule) = cp
-            picked(cp) = True
-            picks.Add cp: pickRule.Add rule
+        cpClean = CleanCpName(cp)
+        If cpClean <> "" And Not ruleTop.Exists(rule) And picks.Count < MAX_PICKS Then
+            If Not picked.Exists(cpClean) Then
+                ruleTop(rule) = cp
+                picked(cpClean) = True
+                picks.Add cpClean: origs.Add cp: pickRule.Add rule
+            End If
         End If
     Next i
 
@@ -136,19 +144,23 @@ Public Function FillCounterparties() As String
     For i = 1 To n
         If picks.Count >= MIN_PICKS Then Exit For
         cp = Split(keys(i), vbTab)(1)
-        If Not picked.Exists(cp) Then
-            picked(cp) = True
-            picks.Add cp: pickRule.Add "(by value) " & Split(keys(i), vbTab)(0)
+        cpClean = CleanCpName(cp)
+        If cpClean <> "" Then
+            If Not picked.Exists(cpClean) Then
+                picked(cpClean) = True
+                picks.Add cpClean: origs.Add cp: pickRule.Add "(by value) " & Split(keys(i), vbTab)(0)
+            End If
         End If
     Next i
 
     ' ---- write names and addresses ----
     Application.EnableEvents = True
     For i = 1 To picks.Count
-        addr = CounterpartyAddress(cd, lastRow, picks(i), cCp, cDir, cBenAddr, cBenCty, cOrgAddr, cOrgCty, addrNote)
+        addr = CounterpartyAddress(cd, lastRow, origs(i), cCp, cDir, cBenAddr, cBenCty, cOrgAddr, cOrgCty, addrNote)
         PutCell home, "J" & (17 + i), picks(i)
         If addr <> "" Then PutCell home, "T" & (17 + i), addr
-        note = note & "   " & i & ". " & picks(i) & "  " & FormatCurrency(PairTotal(pairVal, picks(i)), 2) & _
+        note = note & "   " & i & ". " & picks(i) & "  " & FormatCurrency(PairTotal(pairVal, origs(i)), 2) & _
+               IIf(picks(i) <> origs(i), "  (ECM: " & origs(i) & ")", "") & _
                IIf(addr <> "", "  |  " & addr, "") & IIf(addrNote <> "", "  (" & addrNote & ")", "") & vbCrLf
     Next i
     ProtectHome home
@@ -211,6 +223,28 @@ Private Function CounterpartyAddress(ByVal cd As Worksheet, ByVal lastRow As Lon
         note = (seen.Count - 1) & " other address" & IIf(seen.Count = 2, "", "es") & " seen"
     End If
     CounterpartyAddress = best
+End Function
+
+' Counterparty name safe for file names, PDF merging and searches: "&" -> "and",
+' characters Windows forbids in file names -> space, other punctuation removed,
+' letters (accented too), digits, spaces and hyphens kept; spaces collapsed.
+Public Function CleanCpName(ByVal s As String) As String
+    Dim i As Long, ch As String, out As String
+    s = Replace(s, "&", " and ")
+    For i = 1 To Len(s)
+        ch = Mid$(s, i, 1)
+        If ch Like "[A-Za-z0-9-]" Or ch = " " Then
+            out = out & ch
+        ElseIf AscW(ch) >= 192 And (UCase$(ch) <> LCase$(ch) Or AscW(ch) >= 12288) Then
+            out = out & ch                           ' accented letters, CJK - not curly quotes or symbols
+        ElseIf InStr("\/:*?""<>|" & vbTab & vbCr & vbLf, ch) > 0 Then
+            out = out & " "
+        End If                                       ' anything else is dropped
+    Next i
+    out = Application.WorksheetFunction.Trim(out)
+    Do While Left$(out, 1) = "-": out = Trim$(Mid$(out, 2)): Loop
+    Do While Right$(out, 1) = "-": out = Trim$(Left$(out, Len(out) - 1)): Loop
+    CleanCpName = out
 End Function
 
 ' An address with no street - just a country code or the country itself.
