@@ -90,6 +90,7 @@ Private mRows As Collection
 Private mCEcm As Long, mCVel As Long, mCCust As Long, mCAddr As Long, mCCountry As Long, mCFile As Long
 Private mCProgDesc As Long, mCProgName As Long
 Private mProgramNote As String      ' last import's program line, for the "case ready" message
+Private mProgMatchWord As String    ' set by MatchProgram when only a nShared word matched
 
 ' Watcher state
 Private mWatching As Boolean
@@ -872,15 +873,17 @@ Private Function FillProgram(ByVal ws As Worksheet, ByVal progDesc As String, By
     Dim hit As String, src As String
     On Error GoTo Fail
     If progDesc = "" And progName = "" Then Exit Function
+    mProgMatchWord = ""
     hit = MatchProgram(progDesc): src = progDesc
-    If hit = "" Then hit = MatchProgram(progName): src = progName
+    If hit = "" Then mProgMatchWord = "": hit = MatchProgram(progName): src = progName
     If hit = "" Then
         FillProgram = "Program: '" & IIf(progDesc <> "", progDesc, progName) & _
                       "' is not in Program_Library - pick Program Name (J7) yourself."
         Exit Function
     End If
     PutValue ws, "J7", hit
-    FillProgram = "Program Name (J7): " & Trim$(hit) & IIf(NormName(src) <> NormName(hit), "  (ECM: " & src & ")", "")
+    FillProgram = "Program Name (J7): " & Trim$(hit) & IIf(NormName(src) <> NormName(hit), "  (ECM: " & src & ")", "") & _
+                  IIf(mProgMatchWord <> "", " - matched on the word '" & mProgMatchWord & "', please check", "")
     Exit Function
 Fail:
     FillProgram = "Program: could not fill J7 (" & Err.Description & ")."
@@ -892,7 +895,10 @@ End Function
 '      split by "/" (e.g. "Pomelo (Lemonade/LemFi)" also answers to LemFi);
 '   3. otherwise the LONGEST entry (or alternative) that the value starts with, or
 '      that starts with the value, as whole words - "Airwallex Hong Kong Limited"
-'      picks "Airwallex Hong Kong Ltd" over "Airwallex".
+'      picks "Airwallex Hong Kong Ltd" over "Airwallex";
+'   4. otherwise any entry sharing a distinctive word (not a generic word such as
+'      "global" or "payments", see GenericWord): most nShared words wins, then the
+'      entry with the fewest other words. mProgMatchWord then names the word.
 Private Function MatchProgram(ByVal v As String) As String
     Dim lib As Range, c As Range, alts As Variant, a As Variant, nv As String, na As String
     Dim bestLen As Long, best As String
@@ -929,7 +935,43 @@ Private Function MatchProgram(ByVal v As String) As String
             Next a
         End If
     Next c
+    If best <> "" Then MatchProgram = best: Exit Function
+
+    Dim vw As Variant, lw As Variant, nShared As Long, extra As Long, bestNShared As Long, bestExtra As Long, word As String, bestWord As String
+    bestExtra = 9999
+    For Each c In lib.Cells                                   ' 4. nShared distinctive word
+        If Trim$(CStr(c.Value)) <> "" Then
+            nShared = 0: extra = 0: word = ""
+            For Each lw In Split(NormName(Replace(Replace(Replace(CStr(c.Value), "(", " "), ")", " "), "/", " ")), " ")
+                If Not GenericWord(CStr(lw)) Then
+                    extra = extra + 1
+                    For Each vw In Split(nv, " ")
+                        If CStr(vw) = CStr(lw) Then nShared = nShared + 1: extra = extra - 1: word = CStr(lw): Exit For
+                    Next vw
+                End If
+            Next lw
+            If nShared > 0 Then
+                If nShared > bestNShared Or (nShared = bestNShared And extra < bestExtra) Then
+                    bestNShared = nShared: bestExtra = extra: best = CStr(c.Value): bestWord = word
+                End If
+            End If
+        End If
+    Next c
+    If best <> "" Then mProgMatchWord = bestWord
     MatchProgram = best
+End Function
+
+' Words too common in program names to identify one (also anything under 3 letters).
+Private Function GenericWord(ByVal w As String) As Boolean
+    If Len(w) < 3 Then GenericWord = True: Exit Function
+    Select Case w
+        Case "global", "money", "pay", "payment", "payments", "financial", "finance", "technology", "technologies", _
+             "international", "bank", "banking", "transfer", "transfers", "remit", "remittance", "exchange", _
+             "credit", "union", "card", "cards", "cash", "services", "service", "solutions", "solution", _
+             "securities", "markets", "market", "cooperative", "platform", "digital", "network", "systems", _
+             "group", "holdings", "company", "fintech", "trading", "capital", "usa", "europe", "evolution", "origination"
+            GenericWord = True
+    End Select
 End Function
 
 ' The full name plus the parts in brackets / split by "/".
