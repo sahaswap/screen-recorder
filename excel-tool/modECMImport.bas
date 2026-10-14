@@ -19,7 +19,8 @@ Option Explicit
 '   2. creates the case folders (same rule as START);
 '   3. copies the alert's transaction file from Downloads into
 '      <Desktop>\<ECM>\Transaction Files;
-'   4. runs "Export Trx File" in AUTO_EXPORT_MODE (EN Network), no picker.
+'   4. runs "Export Trx File" in AUTO_EXPORT_MODE (EN Network), no picker;
+'   5. samples the counterparties into J18:J23 / T18:T23 (modCPSample).
 '
 ' Failsafe - nothing already made for a case is made again:
 '   - a Transaction Files folder that already has an Excel file is not copied into;
@@ -59,7 +60,7 @@ Option Explicit
 ' ==========================================================================
 
 Private Const PWD As String = "p7ss"
-Private Const ECM_IMPORT_VERSION As String = "2026-10-14 (Protected View fix)"
+Private Const ECM_IMPORT_VERSION As String = "2026-10-14b (counterparty sampling)"
 Private Const NOTIFY_WHEN_READY As Boolean = True ' on-top "case ready" message when a queued case loads
 ' On-top messages use the Windows MessageBox directly (VBA's MsgBox does not
 ' accept the "topmost" flag) - the same way the OSDD search prompts do, so the
@@ -126,6 +127,11 @@ Public Sub Import_ECM_Info()
                                 ExportModeName(AUTO_EXPORT_MODE) & ")..."
         result = RunAutoExport(ecmID, False)
         Application.StatusBar = False
+        If Left$(result, 2) = "OK" Then
+            Dim cpNote As String
+            cpNote = FillCounterparties()
+            Application.StatusBar = Replace(Split(cpNote & vbCrLf, vbCrLf)(0), vbTab, " ")
+        End If
         If result <> "OK" And Left$(result, 2) = "OK" Then
             MsgBox note & vbCrLf & "EN Network files already exist for this case - " & Mid$(result, 6) & ".", _
                    vbInformation, "Import ECM Info"
@@ -361,7 +367,7 @@ End Function
 ' Steps 1-4 for one queued alert, with no prompts. Leaves the case on Sheet1
 ' for the analyst. Only a failure shows a message.
 Private Sub LoadQueued(ByVal ws As Worksheet, ByVal csv As String, ByVal idx As Long, ByVal stillWaiting As Long)
-    Dim ecmID As String, note As String, copied As String, result As String
+    Dim ecmID As String, note As String, copied As String, result As String, cpNote As String
 
     If LoadCsv(csv) <> "" Then Exit Sub
     ecmID = Field(mRows(idx), mCEcm)
@@ -392,6 +398,7 @@ Private Sub LoadQueued(ByVal ws As Worksheet, ByVal csv As String, ByVal idx As 
         result = RunAutoExport(ecmID, True)
         If result = "" Then result = "export did not finish (see its message)"
     End If
+    If Left$(result, 2) = "OK" Then cpNote = FillCounterparties()
     GoTo Report
 
 Failed:
@@ -409,6 +416,7 @@ Report:
         If NOTIFY_WHEN_READY Then
             TopMessage "ECM case " & ecmID & " is ready in the tool." & vbCrLf & _
                        IIf(stillWaiting > 0, stillWaiting & " more waiting after this one.", "No more alerts waiting.") & vbCrLf & vbCrLf & _
+                       IIf(cpNote <> "", cpNote & vbCrLf, "") & _
                        "Click OK to work it.", "ECM case ready", MB_ICONINFO
         End If
     Else
@@ -538,6 +546,13 @@ Private Function ImportRow(ByVal ws As Worksheet, ByVal idx As Long, ByVal csvPa
 
     Application.EnableEvents = True
     ' Clear what the previous case put there, so nothing carries over.
+    If Trim$(CStr(ws.Range("J9").Value)) <> ecmID Then
+        Dim r As Long
+        For r = 18 To 23
+            PutValue ws, "J" & r, ""
+            PutValue ws, "T" & r, ""
+        Next r
+    End If
     PutValue ws, "J13", ""
     PutValue ws, "J14", ""
     PutValue ws, "L27", ""
