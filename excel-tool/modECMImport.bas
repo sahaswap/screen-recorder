@@ -68,7 +68,7 @@ Option Explicit
 ' ==========================================================================
 
 Private Const PWD As String = "p7ss"
-Private Const ECM_IMPORT_VERSION As String = "2026-10-14f (narratives + step log)"
+Private Const ECM_IMPORT_VERSION As String = "2026-10-15a (program kept for narratives)"
 Private Const NOTIFY_WHEN_READY As Boolean = True ' on-top "case ready" message when a queued case loads
 ' On-top messages use the Windows MessageBox directly (VBA's MsgBox does not
 ' accept the "topmost" flag) - the same way the OSDD search prompts do, so the
@@ -95,7 +95,8 @@ Private mRows As Collection
 Private mCEcm As Long, mCVel As Long, mCCust As Long, mCAddr As Long, mCCountry As Long, mCFile As Long
 Private mCProgDesc As Long, mCProgName As Long
 Private mProgramNote As String      ' last import's program line, for the "case ready" message
-Private mProgMatchWord As String    ' set by MatchProgram when only a nShared word matched
+Private mProgMatchWord As String    ' set by MatchProgram when only a shared word matched
+Private mProgramValue As String     ' library name matched at import - reused by the narratives
 
 ' Watcher state
 Private mWatching As Boolean
@@ -407,6 +408,7 @@ Private Sub LoadQueued(ByVal ws As Worksheet, ByVal csv As String, ByVal idx As 
 
     On Error GoTo Failed
     copied = ImportRow(ws, idx, csv, note)
+    WriteLog ecmID, "step program: " & IIf(mProgramNote = "", "(no program line)", mProgramNote)
     If copied = "" Then
         result = "transaction file not found in Downloads"
     ElseIf AUTO_EXPORT_MODE = "" Then
@@ -769,6 +771,9 @@ Private Function RunAutoNarratives(ByVal ws As Worksheet) As String
     Dim prog As String, d As Variant, out As String, f As String
     On Error GoTo Fail
     prog = CStr(ws.Range("J7").Value)
+    ' J7 can be emptied after the import (Sheet1 clears it whenever J5 changes),
+    ' so fall back to the program matched at import.
+    If Trim$(prog) = "" Then prog = mProgramValue
     For Each d In Array("Escalation", "Non-Escalation")
         Application.EnableEvents = True
         PutValue ws, "J5", CStr(d)
@@ -953,7 +958,15 @@ End Function
 Private Function FillProgram(ByVal ws As Worksheet, ByVal progDesc As String, ByVal progName As String) As String
     Dim hit As String, src As String
     On Error GoTo Fail
-    If progDesc = "" And progName = "" Then Exit Function
+    mProgramValue = ""
+    If progDesc = "" And progName = "" Then
+        If mCProgDesc < 0 And mCProgName < 0 Then
+            FillProgram = "Program: this export file has no program columns (exported before the Focal Entity update) - pick Program Name (J7) yourself."
+        Else
+            FillProgram = "Program: ECM Focal Entity info had no ProgramDescription / ProgramName - pick Program Name (J7) yourself."
+        End If
+        Exit Function
+    End If
     mProgMatchWord = ""
     hit = MatchProgram(progDesc): src = progDesc
     If hit = "" Then mProgMatchWord = "": hit = MatchProgram(progName): src = progName
@@ -963,6 +976,7 @@ Private Function FillProgram(ByVal ws As Worksheet, ByVal progDesc As String, By
         Exit Function
     End If
     PutValue ws, "J7", hit
+    mProgramValue = hit
     FillProgram = "Program Name (J7): " & Trim$(hit) & IIf(NormName(src) <> NormName(hit), "  (ECM: " & src & ")", "") & _
                   IIf(mProgMatchWord <> "", " - matched on the word '" & mProgMatchWord & "', please check", "")
     Exit Function
@@ -978,7 +992,7 @@ End Function
 '      that starts with the value, as whole words - "Airwallex Hong Kong Limited"
 '      picks "Airwallex Hong Kong Ltd" over "Airwallex";
 '   4. otherwise any entry sharing a distinctive word (not a generic word such as
-'      "global" or "payments", see GenericWord): most nShared words wins, then the
+'      "global" or "payments", see GenericWord): most shared words wins, then the
 '      entry with the fewest other words. mProgMatchWord then names the word.
 Private Function MatchProgram(ByVal v As String) As String
     Dim lib As Range, c As Range, alts As Variant, a As Variant, nv As String, na As String
@@ -1020,7 +1034,7 @@ Private Function MatchProgram(ByVal v As String) As String
 
     Dim vw As Variant, lw As Variant, nShared As Long, extra As Long, bestNShared As Long, bestExtra As Long, word As String, bestWord As String
     bestExtra = 9999
-    For Each c In lib.Cells                                   ' 4. nShared distinctive word
+    For Each c In lib.Cells                                   ' 4. shared distinctive word
         If Trim$(CStr(c.Value)) <> "" Then
             nShared = 0: extra = 0: word = ""
             For Each lw In Split(NormName(Replace(Replace(Replace(CStr(c.Value), "(", " "), ")", " "), "/", " ")), " ")
