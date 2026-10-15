@@ -74,7 +74,7 @@ Option Explicit
 ' ==========================================================================
 
 Private Const PWD As String = "p7ss"
-Private Const ECM_IMPORT_VERSION As String = "2026-10-15j (close docs, wider Downloads cleanup)"
+Private Const ECM_IMPORT_VERSION As String = "2026-10-15k (close Excel exports on OneDrive)"
 Private Const NOTIFY_WHEN_READY As Boolean = True ' on-top "case ready" message when a queued case loads
 ' On-top messages use the Windows MessageBox directly (VBA's MsgBox does not
 ' accept the "topmost" flag) - the same way the OSDD search prompts do, so the
@@ -1024,13 +1024,19 @@ Private Function UrlEncodeAll(ByVal s As String) As String
 End Function
 
 ' Closes an open workbook by full path, without saving (it was just saved).
+' Matches by file name too: for files in OneDrive folders Excel reports
+' FullName as a web address, not the C:\ path.
 Public Sub CloseSavedExport(ByVal fullPath As String)
-    Dim wb As Workbook
+    Dim wb As Workbook, nm As String
     If fullPath = "" Then Exit Sub
+    nm = Mid$(fullPath, InStrRev(fullPath, "\") + 1)
+    On Error Resume Next
     For Each wb In Application.Workbooks
-        If StrComp(wb.FullName, fullPath, vbTextCompare) = 0 Then
-            wb.Close SaveChanges:=False
-            Exit Sub
+        If wb.Name <> ThisWorkbook.Name Then
+            If StrComp(wb.FullName, fullPath, vbTextCompare) = 0 Or StrComp(wb.Name, nm, vbTextCompare) = 0 Then
+                wb.Close SaveChanges:=False
+                Exit Sub
+            End If
         End If
     Next wb
 End Sub
