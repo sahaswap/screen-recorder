@@ -31,8 +31,14 @@ Option Explicit
 ' Names written to J18:J23 are cleaned for file names and merging (CleanCpName):
 ' characters Windows forbids in file names -> space, other punctuation removed
 ' ("&" is kept - the tool's file-name, search and merge code all handle it),
-' spaces collapsed. Two names that clean to the same text
-' count as one counterparty. Amounts and addresses still use ECM's spelling.
+' spaces collapsed.
+'
+' Counterparties are grouped by MERCHANT: words containing a digit (booking /
+' reference codes, store numbers) are ignored when comparing names, and so are
+' spaces - "AIRBNB * HMKNMMCRE9" and "AIRBNB * HMP94KJQ23" are one counterparty
+' ("AIRBNB"), "THE HOME DEPOT #0816" and "#1234" are one, "SAMSCLUB" = "SAMS CLUB".
+' Their amounts are added together and the name written is the merchant part.
+' Addresses are looked up over all of a merchant's rows.
 '
 ' Never overwrites: if J18:J23 already has any name, nothing is written.
 ' Run it on its own with Alt+F8 > Sample_Counterparties.
@@ -60,6 +66,7 @@ Public Function FillCounterparties() As String
     Dim picks As New Collection, pickRule As New Collection, picked As Object, origs As New Collection, cpClean As String
     Dim keys() As String, vals() As Double, n As Long, tmpS As String, tmpD As Double
     Dim note As String, addrNote As String, addr As String
+    Dim bk As String, members As Object, variantVal As Object, display As Object, nVariants As Object
 
     On Error GoTo Fail
     Set home = ThisWorkbook.Sheets("Sheet1")
@@ -94,19 +101,37 @@ Public Function FillCounterparties() As String
     Set pairVal = CreateObject("Scripting.Dictionary"): pairVal.CompareMode = vbTextCompare
     Set blankTop = CreateObject("Scripting.Dictionary"): blankTop.CompareMode = vbTextCompare
     Set rules = New Collection
+    Set members = CreateObject("Scripting.Dictionary"): members.CompareMode = vbTextCompare
+    Set variantVal = CreateObject("Scripting.Dictionary"): variantVal.CompareMode = vbTextCompare
+    Set nVariants = CreateObject("Scripting.Dictionary"): nVariants.CompareMode = vbTextCompare
     For r = 2 To lastRow
         rule = Trim$(CStr(cd.Cells(r, cRule).Value))
         cp = Trim$(CStr(cd.Cells(r, cCp).Value))
         amt = NumOf(cd.Cells(r, cAmt).Value)
         If rule = "" Then rule = "(no rule)"
-        If cp = "" Then
+        bk = ""
+        If cp <> "" Then bk = MerchantKey(cp)
+        If bk = "" Then
             blankTop(rule) = blankTop(rule) + amt
         Else
-            key = rule & vbTab & cp
+            key = rule & vbTab & bk
             If Not pairVal.Exists(key) Then pairVal(key) = 0
             pairVal(key) = pairVal(key) + amt
+            If InStr(1, members(bk), "|" & cp & "|", vbTextCompare) = 0 Then
+                members(bk) = IIf(members(bk) = "", "|", members(bk)) & cp & "|"
+                nVariants(bk) = nVariants(bk) + 1
+            End If
+            variantVal(bk & vbTab & cp) = variantVal(bk & vbTab & cp) + amt
         End If
     Next r
+    ' Name written for each merchant: the merchant part of its biggest variant.
+    Set display = CreateObject("Scripting.Dictionary"): display.CompareMode = vbTextCompare
+    Dim bestV As Object: Set bestV = CreateObject("Scripting.Dictionary"): bestV.CompareMode = vbTextCompare
+    For Each key In variantVal.keys
+        bk = Split(key, vbTab)(0)
+        If Not bestV.Exists(bk) Then bestV(bk) = -1E+300
+        If variantVal(key) > bestV(bk) Then bestV(bk) = variantVal(key): display(bk) = MerchantName(Split(key, vbTab)(1))
+    Next key
     If pairVal.Count = 0 Then FillCounterparties = "Counterparties not picked - every alerted transaction has a blank counterparty.": Exit Function
 
     ' ---- all pairs, highest value first ----
@@ -130,38 +155,32 @@ Public Function FillCounterparties() As String
     Set ruleTop = CreateObject("Scripting.Dictionary"): ruleTop.CompareMode = vbTextCompare
     For i = 1 To n                                   ' highest value first, so the first
         rule = Split(keys(i), vbTab)(0)              ' unpicked pair of a rule is its top
-        cp = Split(keys(i), vbTab)(1)
-        cpClean = CleanCpName(cp)
-        If cpClean <> "" And Not ruleTop.Exists(rule) And picks.Count < MAX_PICKS Then
-            If Not picked.Exists(cpClean) Then
-                ruleTop(rule) = cp
-                picked(cpClean) = True
-                picks.Add cpClean: origs.Add cp: pickRule.Add rule
-            End If
+        bk = Split(keys(i), vbTab)(1)
+        If Not ruleTop.Exists(rule) And Not picked.Exists(bk) And picks.Count < MAX_PICKS Then
+            ruleTop(rule) = bk
+            picked(bk) = True
+            picks.Add display(bk): origs.Add bk: pickRule.Add rule
         End If
     Next i
 
     ' ---- fill up to MIN_PICKS by value ----
     For i = 1 To n
         If picks.Count >= MIN_PICKS Then Exit For
-        cp = Split(keys(i), vbTab)(1)
-        cpClean = CleanCpName(cp)
-        If cpClean <> "" Then
-            If Not picked.Exists(cpClean) Then
-                picked(cpClean) = True
-                picks.Add cpClean: origs.Add cp: pickRule.Add "(by value) " & Split(keys(i), vbTab)(0)
-            End If
+        bk = Split(keys(i), vbTab)(1)
+        If Not picked.Exists(bk) Then
+            picked(bk) = True
+            picks.Add display(bk): origs.Add bk: pickRule.Add "(by value) " & Split(keys(i), vbTab)(0)
         End If
     Next i
 
     ' ---- write names and addresses ----
     Application.EnableEvents = True
     For i = 1 To picks.Count
-        addr = CounterpartyAddress(cd, lastRow, origs(i), cCp, cDir, cBenAddr, cBenCty, cOrgAddr, cOrgCty, addrNote)
+        addr = CounterpartyAddress(cd, lastRow, members(origs(i)), cCp, cDir, cBenAddr, cBenCty, cOrgAddr, cOrgCty, addrNote)
         PutCell home, "J" & (17 + i), picks(i)
         If addr <> "" Then PutCell home, "T" & (17 + i), addr
         note = note & "   " & i & ". " & picks(i) & "  " & FormatCurrency(PairTotal(pairVal, origs(i)), 2) & _
-               IIf(picks(i) <> origs(i), "  (ECM: " & origs(i) & ")", "") & _
+               VariantNote(picks(i), members(origs(i)), nVariants(origs(i))) & _
                IIf(addr <> "", "  |  " & addr, "") & IIf(addrNote <> "", "  (" & addrNote & ")", "") & vbCrLf
     Next i
     ProtectHome home
@@ -186,9 +205,10 @@ Fail:
     Application.EnableEvents = True
 End Function
 
-' Most frequent address on the counterparty's side of its rows: DR -> Beneficiary,
+' Most frequent address on the counterparty's side of its rows (all spellings in
+' memberList "|a|b|"): DR -> Beneficiary,
 ' otherwise Originator. note gets "country only (US)" / "n other addresses seen".
-Private Function CounterpartyAddress(ByVal cd As Worksheet, ByVal lastRow As Long, ByVal cp As String, _
+Private Function CounterpartyAddress(ByVal cd As Worksheet, ByVal lastRow As Long, ByVal memberList As String, _
         ByVal cCp As Long, ByVal cDir As Long, ByVal cBenAddr As Long, ByVal cBenCty As Long, _
         ByVal cOrgAddr As Long, ByVal cOrgCty As Long, ByRef note As String) As String
     Dim seen As Object, r As Long, isDr As Boolean, a As String, cty As String, key As Variant
@@ -196,7 +216,7 @@ Private Function CounterpartyAddress(ByVal cd As Worksheet, ByVal lastRow As Lon
     Set seen = CreateObject("Scripting.Dictionary"): seen.CompareMode = vbTextCompare
     note = ""
     For r = 2 To lastRow
-        If StrComp(Trim$(CStr(cd.Cells(r, cCp).Value)), cp, vbTextCompare) = 0 Then
+        If InStr(1, memberList, "|" & Trim$(CStr(cd.Cells(r, cCp).Value)) & "|", vbTextCompare) > 0 Then
             isDr = False
             If cDir > 0 Then isDr = (UCase$(Trim$(CStr(cd.Cells(r, cDir).Value))) = "DR")
             If isDr Then
@@ -245,6 +265,45 @@ Public Function CleanCpName(ByVal s As String) As String
     Do While Left$(out, 1) = "-": out = Trim$(Mid$(out, 2)): Loop
     Do While Right$(out, 1) = "-": out = Trim$(Left$(out, Len(out) - 1)): Loop
     CleanCpName = out
+End Function
+
+' Grouping key for a counterparty: upper-case words without digits (the first
+' word always counts, for names like "7-ELEVEN"), punctuation and spaces removed
+' ("AIRBNB * HMP94KJQ23" -> "AIRBNB", "SAMS CLUB #4989" -> "SAMSCLUB").
+' If nothing is left, the whole cleaned name is the key.
+Private Function MerchantKey(ByVal cp As String) As String
+    Dim w As Variant, k As String, cleaned As String, first As Boolean
+    cleaned = UCase$(CleanCpName(cp))
+    first = True
+    For Each w In Split(cleaned, " ")
+        If first Or Not (w Like "*[0-9]*") Then k = k & Replace(CStr(w), "-", "")
+        first = False
+    Next w
+    If k = "" Then k = Replace(Replace(cleaned, " ", ""), "-", "")
+    MerchantKey = k
+End Function
+
+' Name written for a merchant: the cleaned name without its coded words
+' ("Airbnb Hmknmmcre9" -> "Airbnb", "THE HOME DEPOT #0816" -> "THE HOME DEPOT").
+Private Function MerchantName(ByVal cp As String) As String
+    Dim w As Variant, out As String, cleaned As String, first As Boolean
+    cleaned = CleanCpName(cp)
+    first = True
+    For Each w In Split(cleaned, " ")
+        If (first Or Not (w Like "*[0-9]*")) And w <> "&" Then out = out & " " & w
+        first = False
+    Next w
+    out = Trim$(out)
+    If out = "" Then out = cleaned
+    MerchantName = out
+End Function
+
+' "(ECM: AIRBNB * HMKNMMCRE9 + 1 more)" when the written name differs from ECM's.
+Private Function VariantNote(ByVal written As String, ByVal memberList As String, ByVal n As Long) As String
+    Dim first As String
+    first = Split(Mid$(memberList, 2), "|")(0)
+    If n <= 1 And StrComp(first, written, vbTextCompare) = 0 Then Exit Function
+    VariantNote = "  (ECM: " & first & IIf(n > 1, " + " & (n - 1) & " more", "") & ")"
 End Function
 
 ' An address with no street - just a country code or the country itself.
