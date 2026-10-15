@@ -60,6 +60,8 @@ Option Explicit
 '              Reset (ClearForm) calls ECM_AfterReset, which loads the next
 '              alert straight away and restarts the watcher if Excel lost it.
 '              ECM_Queue_Status shows what is waiting.
+'              BATCH_MODE (default): no Reset needed - each finished case is
+'              zipped and the next loads straight away; see BATCH MODE below.
 '              Self-healing: every entry point traps its own errors and logs
 '              them; a check stuck for over 5 minutes is released; an alert
 '              whose transaction file has not finished downloading is retried
@@ -72,7 +74,7 @@ Option Explicit
 ' ==========================================================================
 
 Private Const PWD As String = "p7ss"
-Private Const ECM_IMPORT_VERSION As String = "2026-10-15e (merge requests without BOM)"
+Private Const ECM_IMPORT_VERSION As String = "2026-10-15f (batch: zip and continue)"
 Private Const NOTIFY_WHEN_READY As Boolean = True ' on-top "case ready" message when a queued case loads
 ' On-top messages use the Windows MessageBox directly (VBA's MsgBox does not
 ' accept the "topmost" flag) - the same way the OSDD search prompts do, so the
@@ -90,6 +92,8 @@ Private Const NARR_TEMPLATE As String = "Wise"     ' template (J6) used for both
 Private Const AUTO_MERGE As Boolean = True         ' start the "Merge All OSDD" Power Automate flow at the end
 Private Const MERGE_URL_CELL As String = "B5"      ' Backend_Settings cell holding that flow's run link (URL mode)
 Private Const MERGE_MODE As String = "WATCH"       ' "WATCH" = Merge Watcher flow, "URL" = start Merge All OSDD by link
+Private Const BATCH_MODE As Boolean = True         ' zip each finished case, reset, go straight to the next (False = wait for Reset)
+Private Const MERGE_WAIT_MIN As Long = 15          ' batch: longest wait for a case's merged PDFs before zipping anyway
 Private Const WATCH_SECONDS As Long = 10          ' how often Downloads is checked
 Private Const BUSY_TIMEOUT_MIN As Long = 45       ' a check running longer than this is treated as stuck (OSDD can take a while)
 Private Const FILE_WAIT_SECONDS As Long = 120     ' how long to wait for a transaction file still downloading
@@ -110,6 +114,9 @@ Private mWatching As Boolean
 Private mNextTick As Date
 Private mBusy As Boolean
 Private mBusySince As Date
+Private mBatchWaitEcm As String     ' batch: finished case waiting for its merged PDFs
+Private mBatchWaitSince As Date
+Private mBatchCaseResult As String
 Private mWaitEcm As String          ' alert waiting for its transaction file
 Private mWaitSince As Date
 
@@ -298,7 +305,33 @@ Private Sub CheckQueue()
     Set ws = ThisWorkbook.Sheets("Sheet1")
 
     PickUpNewExports
+
+    If BATCH_MODE Then
+        Dim timedOut As Boolean
+        ' After an Excel restart: pick up the case that was being finished (marker
+        ' file), but only if it is still the one on the form - a case loaded by
+        ' hand is never zipped or reset.
+        If mBatchWaitEcm = "" Then
+            Dim pend As String
+            pend = Trim$(ReadAllText(BatchWaitFile()))
+            If pend <> "" And pend = Trim$(CStr(ws.Range("J9").Value)) Then
+                mBatchWaitEcm = pend: mBatchWaitSince = Now
+            End If
+        End If
+        If mBatchWaitEcm <> "" Then
+            If Not CaseFilesReady(mBatchWaitEcm, timedOut) Then
+                Application.StatusBar = "ECM batch: case " & mBatchWaitEcm & " - waiting for Merge Watcher to merge its PDFs..."
+                Exit Sub
+            End If
+            FinishCase ws, timedOut
+        End If
+    End If
+
     waiting = NextWaiting(csv, idx)
+    If BATCH_MODE And waiting = 0 And Trim$(CStr(ws.Range("J9").Value)) = "" Then
+        CloseBatchIfDone
+        Exit Sub
+    End If
 
     If Trim$(CStr(ws.Range("J9").Value)) <> "" Then
         If waiting > 0 Then
@@ -462,6 +495,16 @@ Failed:
 
 Report:
     WriteLog ecmID, result
+    If BATCH_MODE Then
+        ' No message: the case is zipped once its merged PDFs are done, then the next loads.
+        mBatchWaitEcm = ecmID
+        mBatchWaitSince = Now
+        WriteBatchWait ecmID
+        mBatchCaseResult = result & IIf(mProgramNote <> "", " | " & mProgramNote, "")
+        Application.StatusBar = "ECM batch: case " & ecmID & " done - waiting for its merged PDFs, then zip and next (" & _
+                                stillWaiting & " more waiting)."
+        Exit Sub
+    End If
     PrepareToolWindow ws
     If Left$(result, 2) = "OK" Then
         Application.StatusBar = "ECM " & ecmID & IIf(result = "OK", " loaded and exported. ", " loaded (EN files already existed, not recreated). ") & _
@@ -800,6 +843,7 @@ Private Function RunAutoNarratives(ByVal ws As Worksheet) As String
         ExportToWord
         gNarrQuiet = False
         f = gNarrLastFile
+        If BATCH_MODE Then CloseWordDoc f        ' open documents are locked and cannot be zipped
         out = out & "   " & d & ": " & IIf(f <> "", Mid$(f, InStrRev(f, "\") + 1), "not saved - see its message") & vbCrLf
     Next d
     RestoreDecision ws, prog
@@ -1105,6 +1149,173 @@ Private Function ExportModeName(ByVal mode As String) As String
         Case Else: ExportModeName = "Legacy"
     End Select
 End Function
+
+' ==========================================================================
+' BATCH MODE - case after case with no one at the keyboard
+' ==========================================================================
+' After a case is loaded, it waits until Merge Watcher has handled all of the
+' case's merge requests (or MERGE_WAIT_MIN passes), closes the case's narrative
+' documents, zips the case folder into the current batch folder
+' (<Desktop>\ECM_Zips\Batch_<date_time>\<ECM>.zip), resets the form silently and
+' loads the next alert. When nothing is left to do, the batch folder itself is
+' zipped (<Desktop>\ECM_Zips\Batch_<date_time>.zip) with batch_summary.txt inside,
+' and one message says so. The current batch survives an Excel restart
+' (Downloads\ECM_Imported\batch_current.txt).
+
+' True when the finished case can be zipped: no merge request of it is left, or
+' the wait has run past MERGE_WAIT_MIN (timedOut is then set).
+Private Function CaseFilesReady(ByVal ecm As String, ByRef timedOut As Boolean) As Boolean
+    Dim f As String
+    timedOut = False
+    On Error Resume Next
+    f = Dir$(MergeRequestFolder() & "\" & ecm & "_*.*")
+    On Error GoTo 0
+    If f = "" Then CaseFilesReady = True: Exit Function
+    If Now - mBatchWaitSince > TimeSerial(0, MERGE_WAIT_MIN, 0) Then timedOut = True: CaseFilesReady = True
+End Function
+
+' Zip the finished case, record it, reset the form.
+Private Sub FinishCase(ByVal ws As Worksheet, ByVal timedOut As Boolean)
+    Dim ecm As String, batchDir As String, zipFile As String, ok As Boolean, line As String
+    ecm = mBatchWaitEcm
+    Application.StatusBar = "ECM batch: zipping case " & ecm & "..."
+    batchDir = CurrentBatchFolder()
+    zipFile = batchDir & "\" & ecm & ".zip"
+    ok = ZipWithPowerShell(Array(CaseFolderPath(ecm)), zipFile)
+    line = ecm & vbTab & IIf(mBatchCaseResult = "", "?", mBatchCaseResult) & _
+           IIf(timedOut, vbTab & "merged PDFs not finished after " & MERGE_WAIT_MIN & " min (is Merge Watcher running?)", "") & _
+           vbTab & IIf(ok, "zipped", "ZIP FAILED")
+    AppendText batchDir & "\batch_summary.txt", line
+    WriteLog ecm, "step zip: " & IIf(ok, zipFile, "FAILED - " & zipFile) & IIf(timedOut, " (merge wait timed out)", "")
+    mBatchWaitEcm = ""
+    mBatchCaseResult = ""
+    WriteBatchWait ""
+    SilentReset ws
+End Sub
+
+' All alerts done: zip the batch folder, forget it, tell the analyst once.
+Private Sub CloseBatchIfDone()
+    Dim flag As String, batchDir As String, zipFile As String, ok As Boolean, n As Long, f As String
+    flag = DownloadsFolder() & "\" & IMPORTED_FOLDER & "\batch_current.txt"
+    If Dir$(flag) = "" Then Exit Sub
+    batchDir = Trim$(ReadAllText(flag))
+    If batchDir = "" Then Kill flag: Exit Sub
+    f = Dir$(batchDir & "\*.zip")
+    Do While f <> "": n = n + 1: f = Dir$(): Loop
+    If n = 0 Then Kill flag: Exit Sub
+    Application.StatusBar = "ECM batch: zipping the whole batch..."
+    zipFile = batchDir & ".zip"
+    ok = ZipWithPowerShell(Array(batchDir), zipFile)
+    Kill flag
+    WriteLog "-", "batch zip: " & IIf(ok, zipFile, "FAILED - " & zipFile) & " (" & n & " case(s))"
+    Application.StatusBar = "ECM batch done: " & n & " case(s) in " & zipFile
+    TopMessage "ECM batch done - " & n & " case(s) zipped." & vbCrLf & vbCrLf & _
+               IIf(ok, zipFile, "The batch zip could not be made - the case zips are in:" & vbCrLf & batchDir) & vbCrLf & vbCrLf & _
+               "Per-case results: batch_summary.txt in the batch.", "ECM batch done", MB_ICONINFO
+End Sub
+
+' The batch folder in use, created (with its marker file) when a batch starts.
+Private Function CurrentBatchFolder() As String
+    Dim flag As String, p As String, fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    flag = DownloadsFolder() & "\" & IMPORTED_FOLDER & "\batch_current.txt"
+    If fso.FileExists(flag) Then p = Trim$(ReadAllText(flag))
+    If p <> "" Then
+        If Not fso.FolderExists(p) Then p = ""
+    End If
+    If p = "" Then
+        p = fso.GetParentFolderName(CaseFolderPath("x")) & "\ECM_Zips"
+        If Not fso.FolderExists(p) Then fso.CreateFolder p
+        p = p & "\Batch_" & Format$(Now, "yyyymmdd_hhnn")
+        If Not fso.FolderExists(p) Then fso.CreateFolder p
+        Dim ts As Object
+        Set ts = fso.CreateTextFile(flag, True)
+        ts.Write p
+        ts.Close
+    End If
+    CurrentBatchFolder = p
+End Function
+
+' Compress-Archive (built into Windows PowerShell 5.1), hidden, waits until done.
+Private Function ZipWithPowerShell(ByVal sources As Variant, ByVal zipFile As String) As Boolean
+    Dim list As String, s As Variant, cmd As String, fso As Object
+    On Error GoTo Fail
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    For Each s In sources
+        list = list & IIf(list = "", "", ",") & "'" & Replace(CStr(s), "'", "''") & "'"
+    Next s
+    If fso.FileExists(zipFile) Then fso.DeleteFile zipFile, True
+    cmd = "powershell -NoProfile -ExecutionPolicy Bypass -Command ""Compress-Archive -LiteralPath " & list & _
+          " -DestinationPath '" & Replace(zipFile, "'", "''") & "' -Force"""
+    CreateObject("WScript.Shell").Run cmd, 0, True
+    ZipWithPowerShell = fso.FileExists(zipFile)
+    Exit Function
+Fail:
+    ZipWithPowerShell = False
+End Function
+
+' What the Reset button clears, without its "Form cleared." message.
+Private Sub SilentReset(ByVal ws As Worksheet)
+    Dim prev As Boolean
+    On Error Resume Next
+    prev = Application.EnableEvents
+    Application.EnableEvents = False
+    ThisWorkbook.Unprotect Password:=PWD
+    ws.Unprotect Password:=PWD
+    Dim area As Variant
+    For Each area In Array("J5:J11", "J13:J15", "J18:J23", "T18:T23", "G27", "L27:N27", "O27")
+        ws.Range(area).Value = ""
+    Next area
+    ProtectSheet ws
+    Application.EnableEvents = prev
+    RefreshSearchMatrixHyperlinks
+End Sub
+
+' Closes a document in Word (if open) - an open .docx is locked and cannot be zipped.
+Private Sub CloseWordDoc(ByVal path As String)
+    Dim wd As Object, d As Object
+    If path = "" Then Exit Sub
+    On Error Resume Next
+    Set wd = GetObject(, "Word.Application")
+    If wd Is Nothing Then Exit Sub
+    For Each d In wd.Documents
+        If StrComp(d.FullName, path, vbTextCompare) = 0 Then d.Close False: Exit For
+    Next d
+End Sub
+
+' Marker of the case being finished, so a restart can carry on with it.
+Private Function BatchWaitFile() As String
+    BatchWaitFile = DownloadsFolder() & "\" & IMPORTED_FOLDER & "\batch_waiting.txt"
+End Function
+
+Private Sub WriteBatchWait(ByVal ecm As String)
+    Dim fso As Object, ts As Object
+    On Error Resume Next
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If ecm = "" Then
+        If fso.FileExists(BatchWaitFile()) Then fso.DeleteFile BatchWaitFile(), True
+    Else
+        Set ts = fso.CreateTextFile(BatchWaitFile(), True)
+        ts.Write ecm
+        ts.Close
+    End If
+End Sub
+
+Private Function ReadAllText(ByVal path As String) As String
+    On Error Resume Next
+    With CreateObject("Scripting.FileSystemObject").OpenTextFile(path, 1)
+        ReadAllText = .ReadAll
+        .Close
+    End With
+End Function
+
+Private Sub AppendText(ByVal path As String, ByVal line As String)
+    On Error Resume Next
+    With CreateObject("Scripting.FileSystemObject").OpenTextFile(path, 8, True)
+        .WriteLine line
+        .Close
+    End With
+End Sub
 
 ' ---- Program Name (J7) ----------------------------------------------------
 ' Writes the Program_Library name matching ECM's ProgramDescription (or, failing
