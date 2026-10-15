@@ -74,7 +74,7 @@ Option Explicit
 ' ==========================================================================
 
 Private Const PWD As String = "p7ss"
-Private Const ECM_IMPORT_VERSION As String = "2026-10-15f (batch: zip and continue)"
+Private Const ECM_IMPORT_VERSION As String = "2026-10-15g (timer fix for OneDrive files)"
 Private Const NOTIFY_WHEN_READY As Boolean = True ' on-top "case ready" message when a queued case loads
 ' On-top messages use the Windows MessageBox directly (VBA's MsgBox does not
 ' accept the "topmost" flag) - the same way the OSDD search prompts do, so the
@@ -258,9 +258,12 @@ Private Function CloseEcmProtectedViews() As Long
     Next i
 End Function
 
-' OnTime needs the workbook name when several workbooks are open.
+' Plain macro name for OnTime. A workbook-qualified name ('Book.xlsm'!Macro) fails
+' for workbooks opened from OneDrive / SharePoint: Excel turns it into the web
+' address (with %20 for spaces) and then cannot find the macro. The tool's own
+' timers use plain names too.
 Private Function MacroRef(ByVal procName As String) As String
-    MacroRef = "'" & ThisWorkbook.Name & "'!" & procName
+    MacroRef = procName
 End Function
 
 Public Sub ECM_Watch_Tick()
