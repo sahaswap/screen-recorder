@@ -218,7 +218,7 @@ If exportMode = "PIVOT" Then
     pivotSavePath = folderPath & slash & pivotFileName
     CloseIfAlreadyOpen pivotSavePath
     SetSheetZoom85 newWbPiv, Array("Pivot Data", "Pivot")
-    newWbPiv.SaveAs fileName:=pivotSavePath, FileFormat:=51
+    pivotSavePath = SafeSaveAs(newWbPiv, pivotSavePath)
 
     newWbPiv.Sheets("Pivot Data").Activate
 
@@ -460,7 +460,7 @@ If exportMode = "EN" Then
     CloseIfAlreadyOpen finalSavePath
     SetSheetZoom85 newWb, Array("Lookback Transactions", "Pivot")
     Application.DisplayAlerts = False
-    newWb.SaveAs fileName:=finalSavePath, FileFormat:=51
+    finalSavePath = SafeSaveAs(newWb, finalSavePath)
     Application.DisplayAlerts = True
     lbSavedPath = finalSavePath
     ' Auto import (quiet): the Lookback file is closed at the end, by its own
@@ -599,7 +599,7 @@ If exportMode = "EN" Then
     CloseIfAlreadyOpen finalSavePath
     SetSheetZoom85 newWb, Array("Raw Transactions", "Alerted Transaction", "Alerted Transaction Pivot", "Non Alerted Transaction")
     Application.DisplayAlerts = False
-    newWb.SaveAs fileName:=finalSavePath, FileFormat:=51
+    finalSavePath = SafeSaveAs(newWb, finalSavePath)
     Application.DisplayAlerts = True
 
     wsRealCD.Cells.Clear
@@ -838,7 +838,7 @@ CloseIfAlreadyOpen finalSavePath
 SetSheetZoom85 newWb, Array("Raw Transactions", "CP Selection", "DeDupe", "Pivot")
 
 Application.DisplayAlerts = False
-newWb.SaveAs fileName:=finalSavePath, FileFormat:=51
+finalSavePath = SafeSaveAs(newWb, finalSavePath)
 Application.DisplayAlerts = True
 
 wsRealCD.Cells.Clear
@@ -1169,6 +1169,48 @@ Private Sub SetSheetZoom85(ByVal wb As Workbook, ByVal sheetNames As Variant)
     Next nm
     On Error GoTo 0
 End Sub
+
+' ==========================================================
+' SafeSaveAs - saves wb as .xlsx and returns the path actually used.
+' A file of that name can be locked for a moment (OneDrive syncing it, or it is
+' open in the other Excel copy), which makes SaveAs fail with error 1004.
+' Retries a few times, then saves as "<name> (2).xlsx", "(3)" ... instead of
+' stopping the export.
+' ==========================================================
+Private Function SafeSaveAs(ByVal wb As Workbook, ByVal targetPath As String) As String
+    Dim attempt As Long, n As Long, tryPath As String, base As String, t As Single
+    Dim oldAlerts As Boolean
+    oldAlerts = Application.DisplayAlerts
+    Application.DisplayAlerts = False
+    base = Left$(targetPath, InStrRev(targetPath, ".") - 1)
+    tryPath = targetPath
+    n = 1
+    For attempt = 1 To 8
+        Err.Clear
+        On Error Resume Next
+        wb.SaveAs fileName:=tryPath, FileFormat:=51
+        If Err.Number = 0 Then
+            On Error GoTo 0
+            Application.DisplayAlerts = oldAlerts
+            SafeSaveAs = tryPath
+            Exit Function
+        End If
+        On Error GoTo 0
+        If attempt < 3 Then
+            ' same name again after a short pause (lock usually clears)
+            t = Timer
+            Do While Timer - t < 2 And Timer >= t
+                DoEvents
+            Loop
+        Else
+            n = n + 1
+            tryPath = base & " (" & n & ").xlsx"
+        End If
+    Next attempt
+    Application.DisplayAlerts = oldAlerts
+    Err.Raise 1004, "SafeSaveAs", "Could not save " & targetPath & _
+        " - the file is open or locked (close it in the other Excel window and try again)."
+End Function
 
 ' ==========================================================
 ' CloseIfAlreadyOpen - safely closes an open target file prior to SaveAs
