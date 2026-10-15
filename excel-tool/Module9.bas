@@ -379,7 +379,7 @@ If exportMode = "EN" Then
     Dim cvLB As Variant
     Dim lastAlertedLB As Date, haveAlertedLB As Boolean, lbStart As Date, lbEnd As Date
     Dim wsLB As Worksheet
-    Dim lbSavedPath As String
+    Dim lbSavedPath As String, lbWb As Workbook
 
     aColLB = 0: aDateColLB = 0
     On Error Resume Next
@@ -463,9 +463,10 @@ If exportMode = "EN" Then
     newWb.SaveAs fileName:=finalSavePath, FileFormat:=51
     Application.DisplayAlerts = True
     lbSavedPath = finalSavePath
-    ' Auto import (quiet): close the Lookback file right away, by its own reference
-    ' - looking it up by name later is unreliable for OneDrive files.
-    If gExportQuiet Then newWb.Close SaveChanges:=False
+    ' Auto import (quiet): the Lookback file is closed at the end, by its own
+    ' reference. Closing it straight after SaveAs (OneDrive still uploading) can
+    ' crash Excel, and looking it up by name later is unreliable for OneDrive.
+    Set lbWb = newWb
 
     ' ---------------------------------------------------------------
     ' 4-AN. Alerted / Non-Alerted Trx File
@@ -626,7 +627,11 @@ If exportMode = "EN" Then
     gExportLastResult = "OK"
     If gExportQuiet Then
         On Error Resume Next
-        newWb.Close SaveChanges:=False          ' the Combined file (Lookback closed when saved)
+        DoEvents
+        newWb.Close SaveChanges:=False          ' the Combined file
+        DoEvents
+        If Not lbWb Is Nothing Then lbWb.Close SaveChanges:=False   ' the Lookback file
+        DoEvents
         CloseSavedExport lbSavedPath            ' backups, by name
         CloseSavedExport finalSavePath
         On Error GoTo 0
