@@ -79,7 +79,8 @@ Option Explicit
 ' ==========================================================================
 
 Private Const PWD As String = "p7ss"
-Private Const ECM_IMPORT_VERSION As String = "2026-10-15n (close case workbooks by ECM number)"
+Private Const ECM_IMPORT_VERSION As String = "2026-10-15o (FIFO export - one copy at a time)"
+Private Const EXPORT_LOCK_MAX_MIN As Long = 20      ' longest wait for the other copy's export
 Private Const NOTIFY_WHEN_READY As Boolean = True ' on-top "case ready" message when a queued case loads
 ' On-top messages use the Windows MessageBox directly (VBA's MsgBox does not
 ' accept the "topmost" flag) - the same way the OSDD search prompts do, so the
@@ -748,14 +749,60 @@ Private Function RunAutoExport(ByVal ecmID As String, ByVal quiet As Boolean) As
         End If
     End If
 
+    ' FIFO: only one tool copy exports at a time - the other waits its turn.
+    Dim lockNo As Integer
+    lockNo = AcquireExportLock(ecmID)
+
     gExportLastResult = ""
     gExportQuiet = quiet
     gExportModeOverride = AUTO_EXPORT_MODE
+    On Error Resume Next
     Consolidated_AML_Workflow
+    On Error GoTo 0
     gExportModeOverride = ""
     gExportQuiet = False
+    ReleaseExportLock lockNo
     RunAutoExport = gExportLastResult
 End Function
+
+' Export turn shared by all tool copies: the copy that holds
+' ECM_Imported\export.lock open (Windows file lock) exports; the other waits and
+' goes next. Windows drops the lock by itself if Excel closes or crashes, so it
+' never gets stuck. Returns the file number to release (0 = ran without it).
+Private Function AcquireExportLock(ByVal ecmID As String) As Integer
+    Dim path As String, f As Integer, started As Date, logged As Boolean
+    path = DownloadsFolder() & "\" & IMPORTED_FOLDER & "\export.lock"
+    started = Now
+    Do
+        f = FreeFile
+        On Error Resume Next
+        Err.Clear
+        Open path For Binary Access Read Write Lock Read Write As #f
+        If Err.Number = 0 Then
+            On Error GoTo 0
+            If logged Then WriteLog ecmID, "export turn after " & _
+                Format$((Now - started) * 86400, "0") & " s waiting for the other copy"
+            AcquireExportLock = f
+            Exit Function
+        End If
+        On Error GoTo 0
+        If Not logged Then WriteLog ecmID, "export: other copy is exporting - waiting (FIFO)": logged = True
+        Application.StatusBar = "ECM auto-import: " & ecmID & " waiting for the other copy's export to finish..."
+        If (Now - started) * 1440 > EXPORT_LOCK_MAX_MIN Then
+            WriteLog ecmID, "export: waited " & EXPORT_LOCK_MAX_MIN & " min - exporting anyway"
+            AcquireExportLock = 0
+            Exit Function
+        End If
+        Application.Wait Now + TimeSerial(0, 0, 2)
+        DoEvents
+    Loop
+End Function
+
+Private Sub ReleaseExportLock(ByVal f As Integer)
+    If f = 0 Then Exit Sub
+    On Error Resume Next
+    Close #f
+End Sub
 
 ' The case's EN "Combined Alerted & Non Alerted Transactions" file, if one was made before.
 Private Function ExistingEnFile(ByVal ecmID As String) As String

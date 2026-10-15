@@ -1369,6 +1369,7 @@ Private Sub CleanTransactionData(ByVal ws As Worksheet)
             ws.Cells(1, lastC).Value = "Counterparty"
             ws.Range(ws.Cells(2, lastC), ws.Cells(lastR, lastC)).FormulaR1C1 = _
                 "=IF(RC" & drCol & "=""DR"", IF(RC" & benCol & "="""","""",RC" & benCol & "), IF(RC" & orgCol & "="""","""",RC" & orgCol & "))"
+            On Error Resume Next      ' formats only; the clipboard may be busy (other copy)
             ws.Cells(1, lastC - 1).Copy
             ws.Cells(1, lastC).PasteSpecial Paste:=xlPasteFormats
             ws.Range(ws.Cells(2, lastC - 1), ws.Cells(lastR, lastC - 1)).Copy
