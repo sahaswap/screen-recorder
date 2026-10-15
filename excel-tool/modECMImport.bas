@@ -79,7 +79,13 @@ Option Explicit
 ' ==========================================================================
 
 Private Const PWD As String = "p7ss"
-Private Const ECM_IMPORT_VERSION As String = "2026-10-15o (FIFO export - one copy at a time)"
+Private Const ECM_IMPORT_VERSION As String = "2026-10-15p (failed alerts retried)"
+' Safety net: a case that fails (export / OSDD / narratives error, or Excel closed
+' or crashed in the middle) is queued again at the end of the queue, up to
+' MAX_TRIES tries in all. After that it is listed in ECM_Imported\Failed_Alerts.txt;
+' Alt+F8 > ECM_Retry_Failed queues those again, ECM_Readd_Alert any one case.
+Private Const MAX_TRIES As Long = 3
+Private Const FAILED_LIST As String = "Failed_Alerts.txt"
 Private Const EXPORT_LOCK_MAX_MIN As Long = 20      ' longest wait for the other copy's export
 Private Const NOTIFY_WHEN_READY As Boolean = True ' on-top "case ready" message when a queued case loads
 ' On-top messages use the Windows MessageBox directly (VBA's MsgBox does not
@@ -127,6 +133,9 @@ Private mBusySince As Date
 Private mBatchWaitEcm As String     ' batch: finished case waiting for its merged PDFs
 Private mBatchWaitSince As Date
 Private mBatchCaseResult As String
+Private mCaseTry As Long           ' try number of the case being worked (1 = first)
+Private mCaseFailed As String       ' why the current case failed ("" = it did not)
+Private mInCase As Boolean          ' LoadQueued is running
 Private mWaitEcm As String          ' alert waiting for its transaction file
 Private mWaitSince As Date
 
@@ -318,6 +327,9 @@ Private Sub CheckQueue()
     Set ws = ThisWorkbook.Sheets("Sheet1")
 
     PickUpNewExports
+    ' A case this copy started but never finished (Excel closed / crashed /
+    ' VBA reset in the middle): queue it again instead of zipping half a case.
+    If mBatchWaitEcm = "" And Not mInCase Then RecoverInterrupted ws
 
     If BATCH_MODE Then
         Dim timedOut As Boolean
@@ -473,6 +485,12 @@ Private Sub LoadQueued(ByVal ws As Worksheet, ByVal csv As String, ByVal idx As 
     If Not ClaimAlert(csv, ecmID) Then Exit Sub        ' another copy of the tool took it
     MarkLoaded csv, ecmID          ' before loading, so a failing alert can never block the queue
     If BATCH_MODE Then WriteBatchWait ecmID           ' in progress - keeps the batch open
+    mInCase = True
+    mCaseFailed = ""
+    mCaseTry = TryFromCsvName(csv)
+    SaveAlertRow ecmID, mRows(1), mRows(idx)        ' kept so the alert can be queued again
+    WriteInProgress ecmID, mCaseTry, ""
+    If mCaseTry > 1 Then WriteLog ecmID, "try " & mCaseTry & " of " & MAX_TRIES
 
     ThisWorkbook.Activate
     ws.Activate
@@ -500,6 +518,8 @@ Private Sub LoadQueued(ByVal ws As Worksheet, ByVal csv As String, ByVal idx As 
             osddNote = RunAutoOsdd()
             cpNote = cpNote & vbCrLf & osddNote
             WriteLog ecmID, "step OSDD: " & FirstLine(osddNote)
+            If InStr(osddNote, "stopped with an error") > 0 Or InStr(osddNote, "did not finish") > 0 Then _
+                mCaseFailed = FirstLine(osddNote)
         End If
         If AUTO_NARRATIVES Then
             Application.StatusBar = "ECM " & ecmID & ": generating narratives..."
@@ -507,6 +527,8 @@ Private Sub LoadQueued(ByVal ws As Worksheet, ByVal csv As String, ByVal idx As 
             narrNote = RunAutoNarratives(ws)
             cpNote = cpNote & vbCrLf & narrNote
             WriteLog ecmID, "step narratives: " & Replace(Replace(narrNote, vbCrLf, " "), "   ", " ")
+            If mCaseFailed = "" And (InStr(narrNote, "stopped with an error") > 0 Or InStr(narrNote, "not saved") > 0) Then _
+                mCaseFailed = "narratives: " & Replace(Replace(narrNote, vbCrLf, " "), "   ", " ")
         End If
         If AUTO_MERGE Then
             mergeNote = RunAutoMerge(ws)
@@ -526,6 +548,17 @@ Failed:
 
 Report:
     WriteLog ecmID, result
+    If Left$(result, 2) <> "OK" And mCaseFailed = "" Then mCaseFailed = result
+    mInCase = False
+    If mCaseFailed = "" Then
+        ClearInProgress
+    ElseIf BATCH_MODE Then
+        WriteInProgress ecmID, mCaseTry, mCaseFailed     ' FinishCase (or a restart) queues it again
+    Else
+        note = HandleFailedCase(ecmID, mCaseTry, mCaseFailed) & vbCrLf & vbCrLf & note
+        ClearInProgress
+        If Left$(result, 2) = "OK" Then result = "step failed: " & mCaseFailed
+    End If
     If BATCH_MODE Then
         ' No message: the case is zipped once its merged PDFs are done, then the next loads.
         mBatchWaitEcm = ecmID
@@ -623,7 +656,8 @@ Public Sub ECM_Queue_Status()
           "Protected View windows open: " & Application.ProtectedViewWindows.Count & vbCrLf & _
           "Case on the form (J9): " & IIf(Trim$(CStr(ThisWorkbook.Sheets("Sheet1").Range("J9").Value)) = "", "none", _
                                           ThisWorkbook.Sheets("Sheet1").Range("J9").Value) & vbCrLf & _
-          "Alerts waiting: " & waiting & vbCrLf
+          "Alerts waiting: " & waiting & vbCrLf & _
+          "Failed alerts (after " & MAX_TRIES & " tries): " & FailedCount() & IIf(FailedCount() > 0, "  - Alt+F8 > ECM_Retry_Failed", "") & vbCrLf
     If waiting > 0 Then
         If LoadCsv(csv) = "" Then msg = msg & "Next: ECM " & Field(mRows(idx), mCEcm) & "  (from " & Mid$(csv, InStrRev(csv, "\") + 1) & ")" & vbCrLf
     End If
@@ -1281,8 +1315,21 @@ Private Sub FinishCase(ByVal ws As Worksheet, ByVal timedOut As Boolean)
     Dim ecm As String, batchDir As String, zipFile As String, ok As Boolean, line As String
     ecm = mBatchWaitEcm
     CloseCaseWorkbooks ecm
-    Application.StatusBar = "ECM batch: zipping case " & ecm & "..."
     batchDir = CurrentBatchFolder()
+    If mCaseFailed <> "" Then
+        ' Failed case: not zipped - queued again (or listed as failed).
+        line = HandleFailedCase(ecm, mCaseTry, mCaseFailed)
+        AppendText batchDir & "\batch_summary.txt", ecm & vbTab & "FAILED (try " & mCaseTry & "): " & mCaseFailed & vbTab & line
+        ClearInProgress
+        mCaseFailed = ""
+        mBatchWaitEcm = ""
+        mBatchCaseResult = ""
+        WriteBatchWait ""
+        SilentReset ws
+        Exit Sub
+    End If
+    ClearInProgress
+    Application.StatusBar = "ECM batch: zipping case " & ecm & "..."
     zipFile = batchDir & "\" & ecm & ".zip"
     ok = MakeZip("ZIP_" & ecm, CaseFolderPath(ecm), zipFile)
     line = ecm & vbTab & IIf(mBatchCaseResult = "", "?", mBatchCaseResult) & _
@@ -1346,6 +1393,8 @@ Private Sub CloseBatchIfDone()
     Application.StatusBar = "ECM batch done: " & n & " case(s) in " & zipFile
     TopMessage "ECM batch done - " & n & " case(s) zipped." & vbCrLf & vbCrLf & _
                IIf(Dir$(zipFile) <> "", zipFile, "The batch zip was not made - the case zips are in:" & vbCrLf & batchDir) & vbCrLf & vbCrLf & _
+               IIf(FailedCount() > 0, FailedCount() & " alert(s) FAILED after " & MAX_TRIES & " tries - see " & FAILED_LIST & _
+                   " in Downloads\" & IMPORTED_FOLDER & " (Alt+F8 > ECM_Retry_Failed to try them again)." & vbCrLf & vbCrLf, "") & _
                "Per-case results: batch_summary.txt in the batch.", "ECM batch done", MB_ICONINFO
 End Sub
 
@@ -1458,6 +1507,174 @@ Public Function ToolInstanceTag() As String
     End If
     ToolInstanceTag = tag
 End Function
+
+' ==========================================================================
+' FAILED ALERTS - retry safety net
+' ==========================================================================
+' Each alert's csv row is kept in ECM_Imported\Alerts\<ECM>.csv. To queue an
+' alert again a one-row export "ECM_Alert_Info_Retry<n>_<ECM>_<time>.csv" is
+' put in ECM_Imported - the queue takes it like any export, after the ones
+' already waiting (oldest first). n = tries already made (0 = start afresh).
+
+Private Function AlertsFolder() As String
+    Dim fso As Object
+    AlertsFolder = DownloadsFolder() & "\" & IMPORTED_FOLDER & "\Alerts"
+    On Error Resume Next
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FolderExists(AlertsFolder) Then fso.CreateFolder AlertsFolder
+End Function
+
+' Try number of an alert from its csv name: Retry<n>_ means try n+1.
+Private Function TryFromCsvName(ByVal csv As String) As Long
+    Dim nm As String
+    nm = Mid$(csv, InStrRev(csv, "\") + 1)
+    TryFromCsvName = 1
+    If StrComp(Left$(nm, 20), "ECM_Alert_Info_Retry", vbTextCompare) = 0 Then
+        If Val(Mid$(nm, 21)) >= 1 Then TryFromCsvName = Val(Mid$(nm, 21)) + 1
+    End If
+End Function
+
+Private Function CsvLine(ByVal rec As Variant) As String
+    Dim i As Long, out As String
+    For i = LBound(rec) To UBound(rec)
+        If i > LBound(rec) Then out = out & ","
+        out = out & """" & Replace(CStr(rec(i)), """", """""") & """"
+    Next i
+    CsvLine = out
+End Function
+
+Private Sub SaveAlertRow(ByVal ecm As String, ByVal header As Variant, ByVal rec As Variant)
+    On Error Resume Next
+    WriteRequest AlertsFolder(), ecm, CsvLine(header) & vbCrLf & CsvLine(rec) & vbCrLf, ".csv"
+End Sub
+
+' Puts the alert back in the queue. tries = tries made so far. False if its row is not kept.
+Private Function RequeueAlert(ByVal ecm As String, ByVal tries As Long) As Boolean
+    Dim src As String
+    src = AlertsFolder() & "\" & ecm & ".csv"
+    If Dir$(src) = "" Then Exit Function
+    On Error GoTo Fail
+    WriteRequest DownloadsFolder() & "\" & IMPORTED_FOLDER, _
+                 "ECM_Alert_Info_Retry" & tries & "_" & ecm & "_" & Format$(Now, "yyyymmdd_hhnnss"), _
+                 ReadUtf8(src), ".csv"
+    RequeueAlert = True
+Fail:
+End Function
+
+' A case failed on try tryNo: queue it again, or list it as failed after MAX_TRIES.
+' Returns a short note for the log / batch summary.
+Private Function HandleFailedCase(ByVal ecm As String, ByVal tryNo As Long, ByVal reason As String) As String
+    reason = Replace(Replace(reason, vbCr, " "), vbLf, " ")
+    If tryNo < MAX_TRIES Then
+        If RequeueAlert(ecm, tryNo) Then
+            HandleFailedCase = "failed on try " & tryNo & " of " & MAX_TRIES & " - queued again"
+            WriteLog ecm, "FAILED (try " & tryNo & "): " & reason & " - queued again at the end of the queue"
+            Exit Function
+        End If
+    End If
+    AppendText DownloadsFolder() & "\" & IMPORTED_FOLDER & "\" & FAILED_LIST, _
+               Format$(Now, "yyyy-mm-dd hh:nn") & vbTab & ecm & vbTab & "tries: " & tryNo & vbTab & reason
+    HandleFailedCase = "FAILED after " & tryNo & " tries - listed in " & FAILED_LIST & " (Alt+F8 > ECM_Retry_Failed)"
+    WriteLog ecm, "FAILED (try " & tryNo & "): " & reason & " - given up, listed in " & FAILED_LIST
+End Function
+
+Private Function InProgressFile() As String
+    InProgressFile = AlertsFolder() & "\inprogress" & ToolInstanceTag() & ".txt"
+End Function
+
+Private Sub WriteInProgress(ByVal ecm As String, ByVal tryNo As Long, ByVal reason As String)
+    Dim ts As Object
+    On Error Resume Next
+    Set ts = CreateObject("Scripting.FileSystemObject").CreateTextFile(InProgressFile(), True)
+    ts.Write ecm & vbTab & tryNo & vbTab & Replace(Replace(reason, vbCr, " "), vbLf, " ")
+    ts.Close
+End Sub
+
+Private Sub ClearInProgress()
+    On Error Resume Next
+    If Dir$(InProgressFile()) <> "" Then Kill InProgressFile()
+End Sub
+
+' Case this copy started but never finished (marker left by a crash, Excel being
+' closed, or a VBA reset): queue it again and free the form and the batch.
+Private Sub RecoverInterrupted(ByVal ws As Worksheet)
+    Dim info As String, parts() As String, ecm As String, tryNo As Long, reason As String, note As String
+    info = Trim$(ReadAllText(InProgressFile()))
+    If info = "" Then Exit Sub
+    parts = Split(info & vbTab & vbTab, vbTab)
+    ecm = Trim$(parts(0)): tryNo = Val(parts(1)): reason = Trim$(parts(2))
+    If tryNo < 1 Then tryNo = 1
+    If reason = "" Then reason = "interrupted - Excel was closed or crashed during the case"
+    ClearInProgress
+    If ecm = "" Then Exit Sub
+    CloseCaseWorkbooks ecm
+    note = HandleFailedCase(ecm, tryNo, reason)
+    If BATCH_MODE Then
+        AppendText CurrentBatchFolder() & "\batch_summary.txt", ecm & vbTab & "FAILED (try " & tryNo & "): " & reason & vbTab & note
+        WriteBatchWait ""
+    End If
+    If Trim$(CStr(ws.Range("J9").Value)) = ecm Then SilentReset ws
+End Sub
+
+Private Function FailedCount() As Long
+    Dim t As String, ln As Variant
+    t = ReadAllText(DownloadsFolder() & "\" & IMPORTED_FOLDER & "\" & FAILED_LIST)
+    For Each ln In Split(Replace(t, vbCr, ""), vbLf)
+        If Trim$(ln) <> "" Then FailedCount = FailedCount + 1
+    Next ln
+End Function
+
+' Alt+F8 > ECM_Retry_Failed: queue every alert in Failed_Alerts.txt again
+' (fresh tries). The list is kept as Failed_Alerts_retried_<time>.txt.
+Public Sub ECM_Retry_Failed()
+    Dim path As String, t As String, ln As Variant, parts() As String, ecm As String
+    Dim done As String, n As Long, bad As String
+    path = DownloadsFolder() & "\" & IMPORTED_FOLDER & "\" & FAILED_LIST
+    t = ReadAllText(path)
+    done = "|"
+    For Each ln In Split(Replace(t, vbCr, ""), vbLf)
+        parts = Split(ln & vbTab & vbTab, vbTab)
+        ecm = Trim$(parts(1))
+        If ecm <> "" And InStr(done, "|" & ecm & "|") = 0 Then
+            done = done & ecm & "|"
+            If RequeueAlert(ecm, 0) Then
+                n = n + 1
+                WriteLog ecm, "queued again by ECM_Retry_Failed"
+            Else
+                bad = bad & "   " & ecm & vbCrLf
+            End If
+        End If
+    Next ln
+    If n = 0 And bad = "" Then MsgBox "No failed alerts.", vbInformation, "ECM retry": Exit Sub
+    On Error Resume Next
+    CreateObject("Scripting.FileSystemObject").MoveFile path, Left$(path, Len(path) - 4) & "_retried_" & Format$(Now, "yyyymmdd_hhnnss") & ".txt"
+    On Error GoTo 0
+    MsgBox n & " failed alert(s) queued again - they load after the alerts already waiting." & _
+           IIf(bad <> "", vbCrLf & vbCrLf & "Could not queue (alert row not kept - export them from ECM again):" & vbCrLf & bad, ""), _
+           vbInformation, "ECM retry"
+    ECM_EnsureWatcher
+End Sub
+
+' Alt+F8 > ECM_Readd_Alert: queue one case again by its ECM number (any case the
+' queue has loaded before, failed or not).
+Public Sub ECM_Readd_Alert()
+    Dim ecm As String
+    ecm = Trim$(InputBox("ECM number of the case to queue again:", "ECM re-add"))
+    If ecm = "" Then Exit Sub
+    If ecm = Trim$(CStr(ThisWorkbook.Sheets("Sheet1").Range("J9").Value)) Then
+        MsgBox "Case " & ecm & " is on the form now - let it finish (or Reset) first.", vbExclamation, "ECM re-add"
+        Exit Sub
+    End If
+    If RequeueAlert(ecm, 0) Then
+        WriteLog ecm, "queued again by ECM_Readd_Alert"
+        MsgBox "Case " & ecm & " queued again - it loads after the alerts already waiting." & vbCrLf & _
+               "Files already in Desktop\" & ecm & " are reused, not recreated.", vbInformation, "ECM re-add"
+        ECM_EnsureWatcher
+    Else
+        MsgBox "Case " & ecm & " was never loaded by the queue on this PC (no saved row in " & _
+               AlertsFolder() & ") - export it from ECM again.", vbExclamation, "ECM re-add"
+    End If
+End Sub
 
 ' Claims an alert for this copy: creates ECM_Imported\Claims\<export>_<ECM>.claim,
 ' which fails if another copy already made it. Returns True if this copy has it.
