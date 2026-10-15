@@ -29,8 +29,10 @@ Option Explicit
 '   7. generates both narratives with the Wise template - Escalation, then
 '      Non-Escalation (Module3 quiet mode) - AUTO_NARRATIVES. Decision/Template
 '      are cleared afterwards so the analyst still makes the call; J7 is kept;
-'   8. starts the Power Automate flow "Merge All OSDD" once (run link in
-'      Backend_Settings!B5) to merge every entity's OSDD PDFs - AUTO_MERGE.
+'   8. merges every entity's OSDD PDFs through Power Automate - AUTO_MERGE:
+'      MERGE_MODE "WATCH" leaves a request for the "Merge Watcher" flow (running
+'      all day, no confirmation per case); "URL" starts the "Merge All OSDD" flow
+'      by its run link in Backend_Settings!B5 (Power Automate asks to Continue).
 '
 ' Failsafe - nothing already made for a case is made again:
 '   - a Transaction Files folder that already has an Excel file is not copied into;
@@ -70,7 +72,7 @@ Option Explicit
 ' ==========================================================================
 
 Private Const PWD As String = "p7ss"
-Private Const ECM_IMPORT_VERSION As String = "2026-10-15b (auto PDF merge)"
+Private Const ECM_IMPORT_VERSION As String = "2026-10-15c (merge watcher)"
 Private Const NOTIFY_WHEN_READY As Boolean = True ' on-top "case ready" message when a queued case loads
 ' On-top messages use the Windows MessageBox directly (VBA's MsgBox does not
 ' accept the "topmost" flag) - the same way the OSDD search prompts do, so the
@@ -86,7 +88,8 @@ Private Const AUTO_OSDD As Boolean = True          ' run the OSDD search (Option
 Private Const AUTO_NARRATIVES As Boolean = True    ' generate the Escalation and Non-Escalation narratives
 Private Const NARR_TEMPLATE As String = "Wise"     ' template (J6) used for both narratives
 Private Const AUTO_MERGE As Boolean = True         ' start the "Merge All OSDD" Power Automate flow at the end
-Private Const MERGE_URL_CELL As String = "B5"      ' Backend_Settings cell holding that flow's run link
+Private Const MERGE_URL_CELL As String = "B5"      ' Backend_Settings cell holding that flow's run link (URL mode)
+Private Const MERGE_MODE As String = "WATCH"       ' "WATCH" = Merge Watcher flow, "URL" = start Merge All OSDD by link
 Private Const WATCH_SECONDS As Long = 10          ' how often Downloads is checked
 Private Const BUSY_TIMEOUT_MIN As Long = 45       ' a check running longer than this is treated as stuck (OSDD can take a while)
 Private Const FILE_WAIT_SECONDS As Long = 120     ' how long to wait for a transaction file still downloading
@@ -828,11 +831,6 @@ End Sub
 Private Function RunAutoMerge(ByVal ws As Worksheet) As String
     Dim url As String, ents As String, r As Long, nm As String, ecm As String, json As String
     On Error GoTo Fail
-    url = Trim$(CStr(ThisWorkbook.Sheets("Backend_Settings").Range(MERGE_URL_CELL).Value))
-    If url = "" Then
-        RunAutoMerge = "PDF merge not started - put the ""Merge All OSDD"" flow's run link in Backend_Settings!" & MERGE_URL_CELL & "."
-        Exit Function
-    End If
     ecm = Trim$(CStr(ws.Range("J9").Value))
     nm = SafeEntity(CStr(ws.Range("J13").Value))
     If nm <> "" Then ents = "Customer|" & nm
@@ -841,6 +839,16 @@ Private Function RunAutoMerge(ByVal ws As Worksheet) As String
         If nm <> "" Then ents = ents & IIf(ents = "", "", ";") & "CP" & (r - 17) & "|CP" & (r - 17) & "_" & nm
     Next r
     If ents = "" Then RunAutoMerge = "PDF merge not started - no customer or counterparty names on Sheet1.": Exit Function
+
+    If UCase$(MERGE_MODE) = "WATCH" Then
+        RunAutoMerge = QueueMergeRequest(ecm, Trim$(CStr(ws.Range("J10").Value)), CaseFolderPath(ecm) & "\OSDD Searches", ents)
+        Exit Function
+    End If
+    url = Trim$(CStr(ThisWorkbook.Sheets("Backend_Settings").Range(MERGE_URL_CELL).Value))
+    If url = "" Then
+        RunAutoMerge = "PDF merge not started - put the ""Merge All OSDD"" flow's run link in Backend_Settings!" & MERGE_URL_CELL & "."
+        Exit Function
+    End If
 
     json = "{""ECMCase"":""" & JsonText(ecm) & """,""AlertID"":""" & JsonText(CStr(ws.Range("J10").Value)) & _
            """,""OsddFolder"":""" & JsonText(CaseFolderPath(ecm) & "\OSDD Searches") & _
@@ -851,6 +859,36 @@ Private Function RunAutoMerge(ByVal ws As Worksheet) As String
     Exit Function
 Fail:
     RunAutoMerge = "PDF merge not started (" & Err.Description & ") - use the PDF Merge button."
+End Function
+
+' MERGE_MODE "WATCH": hand the merge to the "Merge Watcher" flow, which runs all
+' day in Power Automate (started once from its console - no confirmation) and
+' picks up request files. One request = Downloads\ECM_Imported\MergeRequests\
+' <ECM>.txt with four lines: ECMCase, AlertID, OsddFolder, Entities. Written as
+' .tmp and then renamed, so the flow never reads a half-written file.
+Private Function QueueMergeRequest(ByVal ecm As String, ByVal alertId As String, _
+                                   ByVal osddFolder As String, ByVal ents As String) As String
+    Dim fso As Object, dirPath As String, tmp As String, fin As String, st As Object
+    On Error GoTo Fail
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    dirPath = DownloadsFolder() & "\" & IMPORTED_FOLDER
+    If Not fso.FolderExists(dirPath) Then fso.CreateFolder dirPath
+    dirPath = dirPath & "\MergeRequests"
+    If Not fso.FolderExists(dirPath) Then fso.CreateFolder dirPath
+    tmp = dirPath & "\" & ecm & ".tmp"
+    fin = dirPath & "\" & ecm & ".txt"
+    Set st = CreateObject("ADODB.Stream")
+    st.Type = 2: st.Charset = "utf-8": st.Open
+    st.WriteText ecm & vbCrLf & alertId & vbCrLf & osddFolder & vbCrLf & ents & vbCrLf
+    st.SaveToFile tmp, 2
+    st.Close
+    If fso.FileExists(fin) Then fso.DeleteFile fin, True
+    fso.MoveFile tmp, fin
+    QueueMergeRequest = "PDF merge queued for the Merge Watcher flow (start it once a day in Power Automate) for: " & _
+                        Replace(Replace(ents, ";", ", "), "|", " -> ")
+    Exit Function
+Fail:
+    QueueMergeRequest = "PDF merge request could not be written (" & Err.Description & ") - use the PDF Merge button."
 End Function
 
 ' Name usable in a file name and in the Entities list.

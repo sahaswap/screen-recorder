@@ -1,0 +1,88 @@
+MERGE WATCHER - Power Automate Desktop flow (no "Continue" per case)
+===================================================================
+Start it ONCE a day from the Power Automate Desktop console (Run button) - a
+console start never asks for confirmation. It keeps running and merges each
+case the tool hands it:
+
+  The tool writes  Downloads\ECM_Imported\MergeRequests\<ECM>.txt  (4 lines:
+  ECM case, Alert ID, OSDD Searches folder, entities) after each case's
+  narratives. Every 5 seconds the flow looks for such files, merges each
+  entity's OSDD PDFs exactly like your PDF Merge flow (same file names, in the
+  case folder), then deletes the request file.
+
+Requests wait safely if the watcher is not running - start it and it catches up.
+Stop it any time with Stop in the console (e.g. to use the manual PDF Merge
+button: Power Automate runs one flow at a time).
+
+
+ONE-TIME SETUP
+--------------
+1. Power Automate Desktop > + New flow > name it:  Merge Watcher
+   (no input variables needed)
+2. Click in the empty flow area and press Ctrl+V with the script below copied
+   (everything between the ----- lines). If any line shows a red error, tell me
+   which, or build it by hand with the steps further down.
+3. Save. Click Run. Leave it running.
+4. In the tool nothing else to set: MERGE_MODE = "WATCH" is the default in
+   modECMImport (Backend_Settings!B5 is only needed for MERGE_MODE = "URL").
+
+
+SCRIPT
+-----
+System.GetEnvironmentVariable.GetEnvironmentVariable Name: $'''USERPROFILE''' Value=> UserProfile
+SET RequestFolder TO $'''%UserProfile%\\Downloads\\ECM_Imported\\MergeRequests'''
+SET KeepRunning TO True
+LOOP WHILE (KeepRunning) = (True)
+    IF (Folder.IfFolderExists.Exists Folder: RequestFolder) THEN
+        Folder.GetFiles Folder: RequestFolder FileFilter: $'''*.txt''' IncludeSubfolders: False FailOnAccessDenied: False SortBy1: Folder.SortBy.CreationTime SortDescending1: False SortBy2: Folder.SortBy.NoSort SortDescending2: False SortBy3: Folder.SortBy.NoSort SortDescending3: False Files=> Requests
+        LOOP FOREACH Req IN Requests
+            File.ReadTextFromFile.ReadTextIntoList File: Req Encoding: File.TextFileEncoding.UTF8 Contents=> Lines
+            SET ECMCase TO Lines[0]
+            SET AlertID TO Lines[1]
+            SET OsddFolder TO Lines[2]
+            SET Entities TO Lines[3]
+            IF (Folder.IfFolderExists.Exists Folder: OsddFolder) THEN
+                Text.SplitText.SplitWithDelimiter Text: Entities CustomDelimiter: $''';''' IsRegEx: False Result=> EntityList
+                LOOP FOREACH Entry IN EntityList
+                    Text.SplitText.SplitWithDelimiter Text: Entry CustomDelimiter: $'''|''' IsRegEx: False Result=> Parts
+                    SET Prefix TO Parts[0]
+                    SET OutName TO Parts[1]
+                    Folder.GetFiles Folder: OsddFolder FileFilter: $'''*_%Prefix%_*.pdf''' IncludeSubfolders: False FailOnAccessDenied: False SortBy1: Folder.SortBy.Name SortDescending1: True SortBy2: Folder.SortBy.NoSort SortDescending2: False SortBy3: Folder.SortBy.NoSort SortDescending3: False Files=> Files
+                    IF Files.Count > 0 THEN
+                        Pdf.MergeFiles PDFFiles: Files MergedPDFPath: $'''%OsddFolder%\\..\\%ECMCase%_%AlertID%_%OutName%_MergedOSDD.pdf''' IfFileExists: Pdf.IfFileExists.Overwrite PasswordDelimiter: $''',''' MergedPDF=> MergedPDF
+                    END
+                END
+            END
+            File.Delete Files: Req
+        END
+    END
+    WAIT 5
+END
+-----
+
+
+IF PASTING DOES NOT WORK - build it by hand
+  1. System > Get environment variable: USERPROFILE -> UserProfile
+  2. Variables > Set variable: RequestFolder =
+        %UserProfile%\Downloads\ECM_Imported\MergeRequests
+  3. Variables > Set variable: KeepRunning = %True%
+  4. Loops > Loop condition: %KeepRunning% = %True%   (everything below goes inside)
+  5.   Conditionals > If folder exists: %RequestFolder%
+  6.     Folder > Get files in folder: %RequestFolder%, filter *.txt,
+         sort by Creation time (ascending) -> Requests
+  7.     Loops > For each Req in %Requests%:
+  8.       File > Read text from file: %Req%, store content as "List (each line
+           is a list item)", encoding UTF-8 -> Lines
+  9.       Set variable: ECMCase = %Lines[0]%, AlertID = %Lines[1]%,
+           OsddFolder = %Lines[2]%, Entities = %Lines[3]%
+ 10.       If folder exists: %OsddFolder%
+ 11.         Text > Split text: %Entities%, custom delimiter ;  -> EntityList
+ 12.         For each Entry in %EntityList%:
+ 13.           Split text: %Entry%, custom delimiter |  -> Parts
+ 14.           Set variable: Prefix = %Parts[0]%, OutName = %Parts[1]%
+ 15.           Folder > Get files in folder: %OsddFolder%, filter *_%Prefix%_*.pdf,
+               sort by Name, descending -> Files
+ 16.           If %Files.Count% > 0:  PDF > Merge PDF files: %Files% ->
+               %OsddFolder%\..\%ECMCase%_%AlertID%_%OutName%_MergedOSDD.pdf, Overwrite
+ 17.       File > Delete file(s): %Req%      (after the "If folder exists" of step 10)
+ 18.   Flow control > Wait: 5 seconds        (last action inside the loop of step 4)
