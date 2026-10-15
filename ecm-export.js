@@ -11,6 +11,7 @@
 (function () {
   if (document.getElementById('__ecmExport')) return;
 
+  var VERSION = '2026-10-15 (with Program)';   /* shown in the panel title */
   var BASE = location.origin + '/ECM/Case/Statistics.aspx?caseid=';
   var REQ_BASE = location.origin + '/ECM/Case/Requirements.aspx?caseid=';
   /* Focal Entity info tab; the second address is tried if the first does not answer. */
@@ -435,7 +436,8 @@
     'background:#1f2937;color:#f9fafb;padding:12px;border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.4);text-align:left;' + FONT;
   panel.innerHTML =
     '<div style="display:flex;align-items:center;justify-content:space-between;margin:0 0 8px;' + FONT + '">' +
-      '<span style="font-weight:600;font-size:14px">ECM Export Transactions</span>' +
+      '<span style="font-weight:600;font-size:14px">ECM Export Transactions ' +
+        '<span style="font-weight:400;font-size:11px;color:#9ca3af">v' + VERSION + '</span></span>' +
       '<span style="display:flex;align-items:center;gap:8px">' +
         '<span class="__ecmCount" style="font-size:12px;color:#9ca3af"></span>' +
         '<button class="__ecmClose" title="Close" style="all:unset;cursor:pointer;width:22px;height:22px;line-height:22px;text-align:center;' +
