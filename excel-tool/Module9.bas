@@ -359,11 +359,15 @@ If Not drCrCell Is Nothing And Not benNameCell Is Nothing And Not origNameCell I
         WsMaster.Range(WsMaster.Cells(2, lastCol), WsMaster.Cells(LastRowMaster, lastCol)).FormulaR1C1 = _
         "=IF(RC" & drCrCol & "=""DR"", IF(RC" & benNameCol & "="""","""",RC" & benNameCol & "), IF(RC" & origNameCol & "="""","""",RC" & origNameCol & "))"
 
+        ' Formatting only, through the clipboard - which a second copy of the tool may
+        ' be using at the same moment, so a failed paste must not stop the export.
+        On Error Resume Next
         WsMaster.Cells(1, lastCol - 1).Copy
         WsMaster.Cells(1, lastCol).PasteSpecial Paste:=xlPasteFormats
         WsMaster.Range(WsMaster.Cells(2, lastCol - 1), WsMaster.Cells(LastRowMaster, lastCol - 1)).Copy
         WsMaster.Range(WsMaster.Cells(2, lastCol), WsMaster.Cells(LastRowMaster, lastCol)).PasteSpecial Paste:=xlPasteFormats
         Application.CutCopyMode = False
+        On Error GoTo CancelHandler
     End If
 End If
 

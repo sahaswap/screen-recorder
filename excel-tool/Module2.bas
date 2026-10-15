@@ -388,7 +388,7 @@ On Error GoTo ErrorHandler
 
 ' Start every run with a fresh debug log so the tail is always this session.
 On Error Resume Next
-Kill Environ("TEMP") & "\osint_debug.log"
+Kill Environ("TEMP") & "\osint" & ToolInstanceTag() & "_debug.log"
 On Error GoTo ErrorHandler
 LogStep "=== Macro started (v" & TOOL_VERSION & ") ==="
 
@@ -1158,7 +1158,7 @@ Application.StatusBar = False
 MsgBox "Something went wrong and I had to stop." & vbCrLf & vbCrLf & _
 "Error " & errN & ": " & errD & vbCrLf & _
 "Source: " & errS & vbCrLf & vbCrLf & _
-"Details are logged to " & Environ("TEMP") & "\osint_debug.log. " & _
+"Details are logged to " & Environ("TEMP") & "\osint" & ToolInstanceTag() & "_debug.log. " & _
 "Any PDFs already saved are safe in the case folder. " & _
 "You can re-run the macro; already-downloaded searches will be " & _
 "overwritten with fresh copies.", _
@@ -1502,7 +1502,7 @@ If Dir(browserExe) <> "" Then
 profilePath = GetWorkerProfilePath(w)
 If Not FSO.FolderExists(profilePath) Then FSO.CreateFolder profilePath
 
-prewarmPdf = Environ("TEMP") & "\osint_prewarm_w" & w & ".pdf"
+prewarmPdf = Environ("TEMP") & "\osint" & ToolInstanceTag() & "_prewarm_w" & w & ".pdf"
 If Dir(prewarmPdf) <> "" Then Kill prewarmPdf
 
 ' Stripped-down version of the real headless cmd: same flags
@@ -1568,7 +1568,7 @@ If Dir(browserExe) <> "" Then
 profilePath = GetWorkerProfilePath(w)
 If Not FSO.FolderExists(profilePath) Then FSO.CreateFolder profilePath
 
-warmPdf = Environ("TEMP") & "\osint_cookiewarm_w" & w & ".pdf"
+warmPdf = Environ("TEMP") & "\osint" & ToolInstanceTag() & "_cookiewarm_w" & w & ".pdf"
 If Dir(warmPdf) <> "" Then Kill warmPdf
 
 ' Headless visit to google.com (not a search) - loads the page,
@@ -1605,7 +1605,7 @@ SmartWait CSng(WARM_COOKIE_SECONDS), True
 ' drop the throwaway warm-up PDFs.
 For w = 0 To MAX_PARALLEL - 1
 KillEdgeWorkerProcesses w
-warmPdf = Environ("TEMP") & "\osint_cookiewarm_w" & w & ".pdf"
+warmPdf = Environ("TEMP") & "\osint" & ToolInstanceTag() & "_cookiewarm_w" & w & ".pdf"
 If Dir(warmPdf) <> "" Then Kill warmPdf
 Next w
 
@@ -1628,7 +1628,7 @@ Dim allDone As Boolean
 Do
 allDone = True
 For w = 0 To MAX_PARALLEL - 1
-prewarmPdf = Environ("TEMP") & "\osint_prewarm_w" & w & ".pdf"
+prewarmPdf = Environ("TEMP") & "\osint" & ToolInstanceTag() & "_prewarm_w" & w & ".pdf"
 If Dir(prewarmPdf) = "" Then
 allDone = False
 Exit For
@@ -1648,7 +1648,7 @@ Next w
 
 ' Drop the throwaway prewarm PDFs.
 For w = 0 To MAX_PARALLEL - 1
-prewarmPdf = Environ("TEMP") & "\osint_prewarm_w" & w & ".pdf"
+prewarmPdf = Environ("TEMP") & "\osint" & ToolInstanceTag() & "_prewarm_w" & w & ".pdf"
 If Dir(prewarmPdf) <> "" Then Kill prewarmPdf
 Next w
 
@@ -1773,7 +1773,7 @@ End Function
 Public Sub LogStep(ByVal msg As String)
 On Error Resume Next
 Dim fnum As Integer, logPath As String, attempt As Long
-logPath = Environ("TEMP") & "\osint_debug.log"
+logPath = Environ("TEMP") & "\osint" & ToolInstanceTag() & "_debug.log"
 ' Retry up to 3x with Shared lock so Notepad/Notepad++ holding the
 ' file open cannot silently swallow log lines.
 For attempt = 1 To 3
@@ -2911,8 +2911,11 @@ End Function
 
 ' Profile dir name for a worker slot. Doubles as the unique string
 ' the orphan-killer matches on in a process command line.
+' Copy 2 of the tool (Backend_Settings!B7 = 2) uses its own profiles,
+' "OSINT_EdgeWorkerB_n", so two copies running side by side never share - or
+' kill - each other's Edge workers. Copy 1 keeps the original names.
 Private Function GetWorkerProfileName(ByVal workerIdx As Long) As String
-GetWorkerProfileName = "OSINT_EdgeWorker_" & workerIdx
+GetWorkerProfileName = "OSINT_EdgeWorker" & ToolInstanceTag() & "_" & workerIdx
 End Function
 
 Private Function GetWorkerProfilePath(ByVal workerIdx As Long) As String
@@ -3015,7 +3018,7 @@ Q = Chr$(34)   ' one double-quote
 edgeExe = GetEdgePath()
 If Len(edgeExe) = 0 Then Exit Function
 profilePath = GetWorkerProfilePath(workerIdx)
-outPath = Environ$("TEMP") & "\osint_capdetect_w" & workerIdx & ".html"
+outPath = Environ$("TEMP") & "\osint" & ToolInstanceTag() & "_capdetect_w" & workerIdx & ".html"
 
 ' Free this worker's profile + clear any old probe output.
 KillEdgeWorkerProcesses workerIdx

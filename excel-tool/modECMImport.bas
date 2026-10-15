@@ -60,6 +60,11 @@ Option Explicit
 '              Reset (ClearForm) calls ECM_AfterReset, which loads the next
 '              alert straight away and restarts the watcher if Excel lost it.
 '              ECM_Queue_Status shows what is waiting.
+'              Several copies of the tool can run side by side (each in its own
+'              Excel, e.g. started with "excel.exe /x"), one per copy number in
+'              Backend_Settings!B7 (1 = first copy, 2 = second...). Each alert is
+'              claimed with a lock file (ECM_Imported\Claims) so two copies never
+'              take the same one; OSDD browser profiles / temp files are per copy.
 '              BATCH_MODE (default): no Reset needed - each finished case is
 '              zipped and the next loads straight away; see BATCH MODE below.
 '              Self-healing: every entry point traps its own errors and logs
@@ -74,7 +79,7 @@ Option Explicit
 ' ==========================================================================
 
 Private Const PWD As String = "p7ss"
-Private Const ECM_IMPORT_VERSION As String = "2026-10-15k (close Excel exports on OneDrive)"
+Private Const ECM_IMPORT_VERSION As String = "2026-10-15m (two copies side by side)"
 Private Const NOTIFY_WHEN_READY As Boolean = True ' on-top "case ready" message when a queued case loads
 ' On-top messages use the Windows MessageBox directly (VBA's MsgBox does not
 ' accept the "topmost" flag) - the same way the OSDD search prompts do, so the
@@ -414,12 +419,21 @@ Private Function NextWaiting(ByRef csv As String, ByRef idx As Long) As Long
             pending = 0
             loadedList = ReadLoaded(paths(i))
             For r = 2 To mRows.Count
-                If InStr(loadedList, "|" & Field(mRows(r), mCEcm) & "|") = 0 Then
+                If InStr(loadedList, "|" & Field(mRows(r), mCEcm) & "|") = 0 And _
+                   Dir$(ClaimPath(paths(i), Field(mRows(r), mCEcm))) = "" Then
                     pending = pending + 1
                     If csv = "" Then csv = paths(i): idx = r
                 End If
             Next r
             If pending = 0 Then
+                ' Finished export: its claim files are no longer needed.
+                Dim cf As String, cdir As String
+                cdir = DownloadsFolder() & "\" & IMPORTED_FOLDER & "\Claims\"
+                cf = Dir$(Left$(ClaimPath(paths(i), "x"), Len(ClaimPath(paths(i), "x")) - 8) & "_*.claim")
+                Do While cf <> ""
+                    fso.DeleteFile cdir & cf, True
+                    cf = Dir$()
+                Loop
                 If BATCH_MODE Then
                     ' Archive it with the batch (it ends up inside the batch zip).
                     fso.MoveFile paths(i), CurrentBatchFolder() & "\" & fso.GetFileName(paths(i))
@@ -455,7 +469,9 @@ Private Sub LoadQueued(ByVal ws As Worksheet, ByVal csv As String, ByVal idx As 
         End If
     End If
     mWaitEcm = ""
+    If Not ClaimAlert(csv, ecmID) Then Exit Sub        ' another copy of the tool took it
     MarkLoaded csv, ecmID          ' before loading, so a failing alert can never block the queue
+    If BATCH_MODE Then WriteBatchWait ecmID           ' in progress - keeps the batch open
 
     ThisWorkbook.Activate
     ws.Activate
@@ -600,6 +616,7 @@ Public Sub ECM_Queue_Status()
     PickUpNewExports
     waiting = NextWaiting(csv, idx)
     msg = "Version: " & ECM_IMPORT_VERSION & vbCrLf & _
+          "This copy: " & IIf(ToolInstanceTag() = "", "1", ToolInstanceTag()) & " (Backend_Settings!B7)" & vbCrLf & _
           "Watcher: " & IIf(mWatching, "ON", "OFF (run StartEcmWatcher, or press Reset)") & vbCrLf & _
           "Protected View windows open: " & Application.ProtectedViewWindows.Count & vbCrLf & _
           "Case on the form (J9): " & IIf(Trim$(CStr(ThisWorkbook.Sheets("Sheet1").Range("J9").Value)) = "", "none", _
@@ -618,7 +635,8 @@ Private Sub WriteLog(ByVal ecmID As String, ByVal result As String)
     Set fso = CreateObject("Scripting.FileSystemObject")
     path = DownloadsFolder() & "\" & IMPORTED_FOLDER & "\" & LOG_NAME
     Set ts = fso.OpenTextFile(path, 8, True)     ' 8 = append, create if missing
-    ts.WriteLine Format$(Now, "yyyy-mm-dd hh:nn:ss") & vbTab & ecmID & vbTab & result
+    ts.WriteLine Format$(Now, "yyyy-mm-dd hh:nn:ss") & vbTab & ecmID & _
+                 IIf(ToolInstanceTag() <> "", " [copy " & ToolInstanceTag() & "]", "") & vbTab & result
     ts.Close
 End Sub
 
@@ -1221,6 +1239,7 @@ Private Sub CloseBatchIfDone()
     Dim flag As String, info As String, batchDir As String, zipFile As String, n As Long, f As String
     flag = DownloadsFolder() & "\" & IMPORTED_FOLDER & "\batch_current.txt"
     If Dir$(flag) = "" Then Exit Sub
+    If Dir$(DownloadsFolder() & "\" & IMPORTED_FOLDER & "\batch_waiting*.txt") <> "" Then Exit Sub   ' a copy is still on a case
     info = ReadAllText(flag)
     batchDir = Trim$(Replace(Split(Replace(info, vbCr, "") & vbLf, vbLf)(0), "ZIPPING", ""))
     If batchDir = "" Then Kill flag: Exit Sub
@@ -1245,9 +1264,20 @@ Private Sub CloseBatchIfDone()
         ZipWithPowerShell Array(batchDir), zipFile
     End If
 
+    ' Only one copy reports and closes the batch.
+    Dim lockFile As String, lk As Object
+    lockFile = flag & ".closing"
+    On Error Resume Next
+    Set lk = CreateObject("Scripting.FileSystemObject").CreateTextFile(lockFile, False)
+    If Err.Number <> 0 Then Exit Sub
+    lk.Close
+    On Error GoTo 0
     f = Dir$(batchDir & "\*.zip")
     Do While f <> "": n = n + 1: f = Dir$(): Loop
     Kill flag
+    On Error Resume Next
+    Kill lockFile
+    On Error GoTo 0
     WriteLog "-", "batch zip: " & IIf(Dir$(zipFile) <> "", zipFile, "NOT MADE - " & zipFile) & " (" & n & " case zip(s))"
     Application.StatusBar = "ECM batch done: " & n & " case(s) in " & zipFile
     TopMessage "ECM batch done - " & n & " case(s) zipped." & vbCrLf & vbCrLf & _
@@ -1348,9 +1378,51 @@ Private Sub CloseWordDoc(ByVal path As String)
     Next d
 End Sub
 
-' Marker of the case being finished, so a restart can carry on with it.
+' Which copy of the tool this is: "" for copy 1 (Backend_Settings!B7 empty or 1),
+' "B" for 2, "C" for 3... Used to keep each copy's files apart (OSDD browser
+' profiles and temp files in Module2, the batch markers here).
+Public Function ToolInstanceTag() As String
+    Static done As Boolean, tag As String
+    Dim v As String
+    If Not done Then
+        On Error Resume Next
+        v = Trim$(CStr(ThisWorkbook.Sheets("Backend_Settings").Range("B7").Value))
+        If IsNumeric(v) And v <> "" Then
+            If CLng(v) >= 2 And CLng(v) <= 26 Then tag = Chr$(64 + CLng(v))
+        End If
+        done = True
+    End If
+    ToolInstanceTag = tag
+End Function
+
+' Claims an alert for this copy: creates ECM_Imported\Claims\<export>_<ECM>.claim,
+' which fails if another copy already made it. Returns True if this copy has it.
+Private Function ClaimAlert(ByVal csv As String, ByVal ecm As String) As Boolean
+    Dim fso As Object, dirPath As String, ts As Object
+    On Error GoTo Taken
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    dirPath = DownloadsFolder() & "\" & IMPORTED_FOLDER & "\Claims"
+    If Not fso.FolderExists(dirPath) Then fso.CreateFolder dirPath
+    Set ts = fso.CreateTextFile(ClaimPath(csv, ecm), False)     ' False = fail if it exists
+    ts.Write "copy " & IIf(ToolInstanceTag() = "", "1", ToolInstanceTag()) & " " & Format$(Now, "yyyy-mm-dd hh:nn:ss")
+    ts.Close
+    ClaimAlert = True
+    Exit Function
+Taken:
+    ClaimAlert = False
+End Function
+
+Private Function ClaimPath(ByVal csv As String, ByVal ecm As String) As String
+    Dim base As String
+    base = Mid$(csv, InStrRev(csv, "\") + 1)
+    base = Left$(base, Len(base) - 4)
+    ClaimPath = DownloadsFolder() & "\" & IMPORTED_FOLDER & "\Claims\" & base & "_" & ecm & ".claim"
+End Function
+
+' Marker of the case this copy is working on / finishing, so a restart can carry
+' on with it and the batch is not closed while any copy still has a case.
 Private Function BatchWaitFile() As String
-    BatchWaitFile = DownloadsFolder() & "\" & IMPORTED_FOLDER & "\batch_waiting.txt"
+    BatchWaitFile = DownloadsFolder() & "\" & IMPORTED_FOLDER & "\batch_waiting" & ToolInstanceTag() & ".txt"
 End Function
 
 Private Sub WriteBatchWait(ByVal ecm As String)
