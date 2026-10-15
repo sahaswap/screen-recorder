@@ -119,3 +119,59 @@ END
 -----
 Pasting tips: copy from Notepad (not a web page), click once on the empty
 flow area, then Ctrl+V or right-click > Paste.
+
+ADD-ON: ZIPPING (batch mode) - 5 more actions
+=============================================
+Windows Security blocks Excel from starting PowerShell, so the zips are made
+by this flow instead. The tool drops "zip jobs" next to the merge requests:
+   Downloads\ECM_Imported\MergeRequests\ZIP_149305.zipjob
+with 2 lines:  line 1 the folder to zip,  line 2 the zip file to create.
+
+Add these INSIDE the Loop condition, AFTER the For each's End and BEFORE the
+Wait (so: merges first, then zips, then wait):
+
+ A. "Get files in folder"
+        Folder:       %EnvironmentVariableValue%\Downloads\ECM_Imported\MergeRequests
+        File filter:  *.zipjob
+        Rename the produced variable to  ZipJobs
+
+ B. "For each"
+        Value to iterate:  %ZipJobs%
+        Store into:        ZipJob
+    -> C, D and E go INSIDE this For each
+
+ C. "Read text from file"
+        File path:         %ZipJob%
+        Store content as:  List (each line is a list item)
+        Encoding:          UTF-8
+        Rename the produced variable to  ZipLines
+
+ D. "ZIP files"   (Actions pane: Compression > ZIP files)
+        Archive path:      %ZipLines[1]%
+        Files to zip:      %ZipLines[0]%
+        Compression level: Normal (leave password and comment empty)
+        On error -> Continue flow run -> Go to next action  (like the merge)
+
+ E. "Delete file(s)"
+        File(s) to delete: %ZipJob%
+        On error -> Continue flow run -> Go to next action
+
+Finished flow:
+   Get Windows environment variable
+   Loop condition 1 = 1
+       Get files in folder  -> Requests        (*.txt)
+       For each CurrentItem in Requests
+           ... merge actions as before ...
+       End
+       Get files in folder  -> ZipJobs         (*.zipjob)
+       For each ZipJob in ZipJobs
+           Read text from file  -> ZipLines
+           ZIP files  %ZipLines[0]%  ->  %ZipLines[1]%
+           Delete file(s)  %ZipJob%
+       End
+       Wait 5
+   End
+
+The case zips land in  Desktop\ECM_Zips\Batch_<date_time>\<ECM>.zip  and, when
+all alerts are done, the batch folder is zipped to  Desktop\ECM_Zips\Batch_<date_time>.zip
+(the tool waits for the case zips before asking for the batch zip).

@@ -74,7 +74,7 @@ Option Explicit
 ' ==========================================================================
 
 Private Const PWD As String = "p7ss"
-Private Const ECM_IMPORT_VERSION As String = "2026-10-15g (timer fix for OneDrive files)"
+Private Const ECM_IMPORT_VERSION As String = "2026-10-15i (watcher zips, Downloads cleanup)"
 Private Const NOTIFY_WHEN_READY As Boolean = True ' on-top "case ready" message when a queued case loads
 ' On-top messages use the Windows MessageBox directly (VBA's MsgBox does not
 ' accept the "topmost" flag) - the same way the OSDD search prompts do, so the
@@ -94,6 +94,10 @@ Private Const MERGE_URL_CELL As String = "B5"      ' Backend_Settings cell holdi
 Private Const MERGE_MODE As String = "WATCH"       ' "WATCH" = Merge Watcher flow, "URL" = start Merge All OSDD by link
 Private Const BATCH_MODE As Boolean = True         ' zip each finished case, reset, go straight to the next (False = wait for Reset)
 Private Const MERGE_WAIT_MIN As Long = 15          ' batch: longest wait for a case's merged PDFs before zipping anyway
+' "WATCHER" = the Merge Watcher flow zips (ZIP files action) from *.zipjob files;
+' "POWERSHELL" = Excel runs Compress-Archive itself (blocked on the VDI by Windows Security).
+Private Const ZIP_MODE As String = "WATCHER"
+Private Const CLEAN_DOWNLOADS As Boolean = True    ' delete a case's transaction file from Downloads once it is in the case folder
 Private Const WATCH_SECONDS As Long = 10          ' how often Downloads is checked
 Private Const BUSY_TIMEOUT_MIN As Long = 45       ' a check running longer than this is treated as stuck (OSDD can take a while)
 Private Const FILE_WAIT_SECONDS As Long = 120     ' how long to wait for a transaction file still downloading
@@ -416,9 +420,15 @@ Private Function NextWaiting(ByRef csv As String, ByRef idx As Long) As Long
                 End If
             Next r
             If pending = 0 Then
-                fso.MoveFile paths(i), folder & "\" & DONE_PREFIX & fso.GetFileName(paths(i))
-                If fso.FileExists(LoadedPath(paths(i))) Then _
-                    fso.MoveFile LoadedPath(paths(i)), folder & "\" & DONE_PREFIX & fso.GetFileName(LoadedPath(paths(i)))
+                If BATCH_MODE Then
+                    ' Archive it with the batch (it ends up inside the batch zip).
+                    fso.MoveFile paths(i), CurrentBatchFolder() & "\" & fso.GetFileName(paths(i))
+                    If fso.FileExists(LoadedPath(paths(i))) Then fso.DeleteFile LoadedPath(paths(i)), True
+                Else
+                    fso.MoveFile paths(i), folder & "\" & DONE_PREFIX & fso.GetFileName(paths(i))
+                    If fso.FileExists(LoadedPath(paths(i))) Then _
+                        fso.MoveFile LoadedPath(paths(i)), folder & "\" & DONE_PREFIX & fso.GetFileName(LoadedPath(paths(i)))
+                End If
             End If
             total = total + pending
         End If
@@ -690,6 +700,7 @@ Private Function ImportRow(ByVal ws As Worksheet, ByVal idx As Long, ByVal csvPa
     caseFolder = MakeCaseFolders(ecmID)
     copied = FirstExcelIn(caseFolder & "\Transaction Files")
     If copied <> "" Then
+        RemoveDownloadedCopy csvPath, Field(rec, mCFile)
         note = note & vbCrLf & "Transaction file already in the case folder (not copied again):" & vbCrLf & _
                "   " & copied & vbCrLf
         ImportRow = copied
@@ -948,11 +959,12 @@ End Function
 
 ' UTF-8 WITHOUT the byte-order mark, so line 1 (the folder path) has no hidden
 ' character in front of it when Power Automate reads the file.
-Private Sub WriteRequest(ByVal dirPath As String, ByVal baseName As String, ByVal body As String)
+Private Sub WriteRequest(ByVal dirPath As String, ByVal baseName As String, ByVal body As String, _
+                         Optional ByVal ext As String = ".txt")
     Dim fso As Object, st As Object, bin As Object, tmp As String, fin As String
     Set fso = CreateObject("Scripting.FileSystemObject")
     tmp = dirPath & "\" & baseName & ".tmp"
-    fin = dirPath & "\" & baseName & ".txt"
+    fin = dirPath & "\" & baseName & ext
     Set st = CreateObject("ADODB.Stream")
     st.Type = 2: st.Charset = "utf-8": st.Open
     st.WriteText body
@@ -1184,10 +1196,10 @@ Private Sub FinishCase(ByVal ws As Worksheet, ByVal timedOut As Boolean)
     Application.StatusBar = "ECM batch: zipping case " & ecm & "..."
     batchDir = CurrentBatchFolder()
     zipFile = batchDir & "\" & ecm & ".zip"
-    ok = ZipWithPowerShell(Array(CaseFolderPath(ecm)), zipFile)
+    ok = MakeZip("ZIP_" & ecm, CaseFolderPath(ecm), zipFile)
     line = ecm & vbTab & IIf(mBatchCaseResult = "", "?", mBatchCaseResult) & _
            IIf(timedOut, vbTab & "merged PDFs not finished after " & MERGE_WAIT_MIN & " min (is Merge Watcher running?)", "") & _
-           vbTab & IIf(ok, "zipped", "ZIP FAILED")
+           vbTab & IIf(ok, IIf(UCase$(ZIP_MODE) = "WATCHER", "zip requested", "zipped"), "ZIP FAILED")
     AppendText batchDir & "\batch_summary.txt", line
     WriteLog ecm, "step zip: " & IIf(ok, zipFile, "FAILED - " & zipFile) & IIf(timedOut, " (merge wait timed out)", "")
     mBatchWaitEcm = ""
@@ -1197,32 +1209,73 @@ Private Sub FinishCase(ByVal ws As Worksheet, ByVal timedOut As Boolean)
 End Sub
 
 ' All alerts done: zip the batch folder, forget it, tell the analyst once.
+' In WATCHER mode this runs over a few checks: wait until the watcher has made
+' every case zip, then ask it for the batch zip, then report once that exists.
 Private Sub CloseBatchIfDone()
-    Dim flag As String, batchDir As String, zipFile As String, ok As Boolean, n As Long, f As String
+    Dim flag As String, info As String, batchDir As String, zipFile As String, n As Long, f As String
     flag = DownloadsFolder() & "\" & IMPORTED_FOLDER & "\batch_current.txt"
     If Dir$(flag) = "" Then Exit Sub
-    batchDir = Trim$(ReadAllText(flag))
+    info = ReadAllText(flag)
+    batchDir = Trim$(Replace(Split(Replace(info, vbCr, "") & vbLf, vbLf)(0), "ZIPPING", ""))
     If batchDir = "" Then Kill flag: Exit Sub
+    zipFile = batchDir & ".zip"
+
+    If UCase$(ZIP_MODE) = "WATCHER" Then
+        If Dir$(MergeRequestFolder() & "\*.zipjob") <> "" Then
+            Application.StatusBar = "ECM batch: waiting for Merge Watcher to finish zipping..."
+            Exit Sub
+        End If
+        If InStr(info, "ZIPPING") = 0 Then
+            f = Dir$(batchDir & "\*.zip")
+            Do While f <> "": n = n + 1: f = Dir$(): Loop
+            If n = 0 And Dir$(batchDir & "\batch_summary.txt") = "" Then Kill flag: Exit Sub
+            QueueZipJob "ZIP_" & Mid$(batchDir, InStrRev(batchDir, "\") + 1), batchDir, zipFile
+            AppendText flag, "ZIPPING"
+            Application.StatusBar = "ECM batch: Merge Watcher is zipping the whole batch..."
+            Exit Sub
+        End If
+    Else
+        Application.StatusBar = "ECM batch: zipping the whole batch..."
+        ZipWithPowerShell Array(batchDir), zipFile
+    End If
+
     f = Dir$(batchDir & "\*.zip")
     Do While f <> "": n = n + 1: f = Dir$(): Loop
-    If n = 0 Then Kill flag: Exit Sub
-    Application.StatusBar = "ECM batch: zipping the whole batch..."
-    zipFile = batchDir & ".zip"
-    ok = ZipWithPowerShell(Array(batchDir), zipFile)
     Kill flag
-    WriteLog "-", "batch zip: " & IIf(ok, zipFile, "FAILED - " & zipFile) & " (" & n & " case(s))"
+    WriteLog "-", "batch zip: " & IIf(Dir$(zipFile) <> "", zipFile, "NOT MADE - " & zipFile) & " (" & n & " case zip(s))"
     Application.StatusBar = "ECM batch done: " & n & " case(s) in " & zipFile
     TopMessage "ECM batch done - " & n & " case(s) zipped." & vbCrLf & vbCrLf & _
-               IIf(ok, zipFile, "The batch zip could not be made - the case zips are in:" & vbCrLf & batchDir) & vbCrLf & vbCrLf & _
+               IIf(Dir$(zipFile) <> "", zipFile, "The batch zip was not made - the case zips are in:" & vbCrLf & batchDir) & vbCrLf & vbCrLf & _
                "Per-case results: batch_summary.txt in the batch.", "ECM batch done", MB_ICONINFO
 End Sub
+
+' Zip a folder: through the Merge Watcher flow (ZIP_MODE "WATCHER", returns True
+' once the job is handed over) or with PowerShell (returns True if the zip exists).
+Private Function MakeZip(ByVal jobName As String, ByVal folder As String, ByVal zipFile As String) As Boolean
+    If UCase$(ZIP_MODE) = "WATCHER" Then
+        MakeZip = QueueZipJob(jobName, folder, zipFile)
+    Else
+        MakeZip = ZipWithPowerShell(Array(folder), zipFile)
+    End If
+End Function
+
+' Zip job for the Merge Watcher flow: MergeRequests\<name>.zipjob, two lines -
+' the folder to zip and the zip file to create.
+Private Function QueueZipJob(ByVal jobName As String, ByVal folder As String, ByVal zipFile As String) As Boolean
+    On Error GoTo Fail
+    WriteRequest MergeRequestFolder(), jobName, folder & vbCrLf & zipFile & vbCrLf, ".zipjob"
+    QueueZipJob = True
+    Exit Function
+Fail:
+    QueueZipJob = False
+End Function
 
 ' The batch folder in use, created (with its marker file) when a batch starts.
 Private Function CurrentBatchFolder() As String
     Dim flag As String, p As String, fso As Object
     Set fso = CreateObject("Scripting.FileSystemObject")
     flag = DownloadsFolder() & "\" & IMPORTED_FOLDER & "\batch_current.txt"
-    If fso.FileExists(flag) Then p = Trim$(ReadAllText(flag))
+    If fso.FileExists(flag) Then p = Trim$(Replace(Split(Replace(ReadAllText(flag), vbCr, "") & vbLf, vbLf)(0), "ZIPPING", ""))
     If p <> "" Then
         If Not fso.FolderExists(p) Then p = ""
     End If
@@ -1233,7 +1286,7 @@ Private Function CurrentBatchFolder() As String
         If Not fso.FolderExists(p) Then fso.CreateFolder p
         Dim ts As Object
         Set ts = fso.CreateTextFile(flag, True)
-        ts.Write p
+        ts.WriteLine p                ' own line - "ZIPPING" may be appended later
         ts.Close
     End If
     CurrentBatchFolder = p
@@ -1560,7 +1613,25 @@ Private Function CopyTransactionFile(ByVal csvPath As String, ByVal trxFile As S
 
     fso.CopyFile src, destFolder & "\", False     ' never overwrite
     CopyTransactionFile = destFolder & "\" & fso.GetFileName(src)
+    ' The copy is in the case folder now - remove the download (only this file).
+    If CLEAN_DOWNLOADS And fso.FileExists(CopyTransactionFile) Then
+        On Error Resume Next
+        fso.DeleteFile src, True
+        On Error GoTo 0
+    End If
 End Function
+
+' Case folder already has its transaction file: remove the same file from
+' Downloads if the export left it there again.
+Private Sub RemoveDownloadedCopy(ByVal csvPath As String, ByVal trxFile As String)
+    Dim fso As Object, p As Variant
+    If Not CLEAN_DOWNLOADS Or trxFile = "" Then Exit Sub
+    On Error Resume Next
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    For Each p In Array(DownloadsFolder(), Left$(csvPath, InStrRev(csvPath, "\") - 1))
+        If fso.FileExists(p & "\" & trxFile) Then fso.DeleteFile p & "\" & trxFile, True
+    Next p
+End Sub
 
 ' --------------------------------------------------------------------------
 ' CSV reading
