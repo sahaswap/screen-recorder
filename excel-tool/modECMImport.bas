@@ -74,7 +74,7 @@ Option Explicit
 ' ==========================================================================
 
 Private Const PWD As String = "p7ss"
-Private Const ECM_IMPORT_VERSION As String = "2026-10-15i (watcher zips, Downloads cleanup)"
+Private Const ECM_IMPORT_VERSION As String = "2026-10-15j (close docs, wider Downloads cleanup)"
 Private Const NOTIFY_WHEN_READY As Boolean = True ' on-top "case ready" message when a queued case loads
 ' On-top messages use the Windows MessageBox directly (VBA's MsgBox does not
 ' accept the "topmost" flag) - the same way the OSDD search prompts do, so the
@@ -700,7 +700,7 @@ Private Function ImportRow(ByVal ws As Worksheet, ByVal idx As Long, ByVal csvPa
     caseFolder = MakeCaseFolders(ecmID)
     copied = FirstExcelIn(caseFolder & "\Transaction Files")
     If copied <> "" Then
-        RemoveDownloadedCopy csvPath, Field(rec, mCFile)
+        RemoveAlertDownloads ecmID
         note = note & vbCrLf & "Transaction file already in the case folder (not copied again):" & vbCrLf & _
                "   " & copied & vbCrLf
         ImportRow = copied
@@ -1334,8 +1334,11 @@ Private Sub CloseWordDoc(ByVal path As String)
     On Error Resume Next
     Set wd = GetObject(, "Word.Application")
     If wd Is Nothing Then Exit Sub
+    ' Match by file name too: for files in OneDrive folders Word reports FullName
+    ' as a web address, not the C:\ path.
     For Each d In wd.Documents
-        If StrComp(d.FullName, path, vbTextCompare) = 0 Then d.Close False: Exit For
+        If StrComp(d.FullName, path, vbTextCompare) = 0 Or _
+           StrComp(d.Name, Mid$(path, InStrRev(path, "\") + 1), vbTextCompare) = 0 Then d.Close False: Exit For
     Next d
 End Sub
 
@@ -1613,24 +1616,29 @@ Private Function CopyTransactionFile(ByVal csvPath As String, ByVal trxFile As S
 
     fso.CopyFile src, destFolder & "\", False     ' never overwrite
     CopyTransactionFile = destFolder & "\" & fso.GetFileName(src)
-    ' The copy is in the case folder now - remove the download (only this file).
-    If CLEAN_DOWNLOADS And fso.FileExists(CopyTransactionFile) Then
-        On Error Resume Next
-        fso.DeleteFile src, True
-        On Error GoTo 0
-    End If
+    ' The copy is in the case folder now - remove this alert's downloads.
+    If CLEAN_DOWNLOADS And fso.FileExists(CopyTransactionFile) Then RemoveAlertDownloads ecmID
 End Function
 
-' Case folder already has its transaction file: remove the same file from
-' Downloads if the export left it there again.
-Private Sub RemoveDownloadedCopy(ByVal csvPath As String, ByVal trxFile As String)
-    Dim fso As Object, p As Variant
-    If Not CLEAN_DOWNLOADS Or trxFile = "" Then Exit Sub
+' Deletes this alert's exported files ("<ECM>_*.xls*", including Edge's
+' "... (1).xlsx" duplicates) from Downloads. Nothing else is touched.
+Private Sub RemoveAlertDownloads(ByVal ecmID As String)
+    Dim fso As Object, f As String, list As New Collection, item As Variant, n As Long
+    If Not CLEAN_DOWNLOADS Or ecmID = "" Then Exit Sub
     On Error Resume Next
     Set fso = CreateObject("Scripting.FileSystemObject")
-    For Each p In Array(DownloadsFolder(), Left$(csvPath, InStrRev(csvPath, "\") - 1))
-        If fso.FileExists(p & "\" & trxFile) Then fso.DeleteFile p & "\" & trxFile, True
-    Next p
+    f = Dir$(DownloadsFolder() & "\" & ecmID & "_*.xls*")
+    Do While f <> ""
+        list.Add DownloadsFolder() & "\" & f
+        f = Dir$()
+    Loop
+    For Each item In list
+        Err.Clear
+        fso.DeleteFile item, True
+        If Err.Number = 0 Then n = n + 1
+    Next item
+    WriteLog ecmID, "step cleanup: removed " & n & " file(s) from Downloads" & _
+                    IIf(list.Count > n, " (" & (list.Count - n) & " could not be deleted - open?)", "")
 End Sub
 
 ' --------------------------------------------------------------------------

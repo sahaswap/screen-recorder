@@ -188,6 +188,9 @@ If Err.Number <> 0 Then
     Err.Clear
 Else
     gNarrLastFile = folderPath & wordFileName
+    ' Auto mode: close the saved document so the case folder can be zipped
+    ' (Word keeps open documents locked).
+    If gNarrQuiet Then wdDoc.Close SaveChanges:=False
 End If
 On Error GoTo 0
 
