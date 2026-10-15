@@ -459,6 +459,9 @@ If exportMode = "EN" Then
     newWb.SaveAs fileName:=finalSavePath, FileFormat:=51
     Application.DisplayAlerts = True
     lbSavedPath = finalSavePath
+    ' Auto import (quiet): close the Lookback file right away, by its own reference
+    ' - looking it up by name later is unreliable for OneDrive files.
+    If gExportQuiet Then newWb.Close SaveChanges:=False
 
     ' ---------------------------------------------------------------
     ' 4-AN. Alerted / Non-Alerted Trx File
@@ -618,8 +621,11 @@ If exportMode = "EN" Then
 
     gExportLastResult = "OK"
     If gExportQuiet Then
-        CloseSavedExport lbSavedPath
+        On Error Resume Next
+        newWb.Close SaveChanges:=False          ' the Combined file (Lookback closed when saved)
+        CloseSavedExport lbSavedPath            ' backups, by name
         CloseSavedExport finalSavePath
+        On Error GoTo 0
         Exit Sub
     End If
     MsgBox "EN Network export complete! Both files were generated:" & vbCrLf & vbCrLf & _
