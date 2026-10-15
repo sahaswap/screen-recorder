@@ -79,12 +79,18 @@ Option Explicit
 ' ==========================================================================
 
 Private Const PWD As String = "p7ss"
-Private Const ECM_IMPORT_VERSION As String = "2026-10-15p (failed alerts retried)"
+Private Const ECM_IMPORT_VERSION As String = "2026-10-15q (failed alerts retried automatically)"
 ' Safety net: a case that fails (export / OSDD / narratives error, or Excel closed
 ' or crashed in the middle) is queued again at the end of the queue, up to
 ' MAX_TRIES tries in all. After that it is listed in ECM_Imported\Failed_Alerts.txt;
 ' Alt+F8 > ECM_Retry_Failed queues those again, ECM_Readd_Alert any one case.
 Private Const MAX_TRIES As Long = 3
+' When the queue is otherwise empty, alerts on the failed list are queued again
+' by themselves - RETRY_COOLDOWN_MIN after the last failure (gives a stuck
+' download / a site block time to clear), up to AUTO_RETRY_ROUNDS rounds. Only
+' then does the batch close, with whatever still failed listed.
+Private Const AUTO_RETRY_ROUNDS As Long = 2
+Private Const RETRY_COOLDOWN_MIN As Long = 10
 Private Const FAILED_LIST As String = "Failed_Alerts.txt"
 Private Const EXPORT_LOCK_MAX_MIN As Long = 20      ' longest wait for the other copy's export
 Private Const NOTIFY_WHEN_READY As Boolean = True ' on-top "case ready" message when a queued case loads
@@ -353,8 +359,9 @@ Private Sub CheckQueue()
     End If
 
     waiting = NextWaiting(csv, idx)
-    If BATCH_MODE And waiting = 0 And Trim$(CStr(ws.Range("J9").Value)) = "" Then
-        CloseBatchIfDone
+    If waiting = 0 And Trim$(CStr(ws.Range("J9").Value)) = "" Then
+        If AutoRetryFailed() Then Exit Sub          ' failed alerts queued again / waiting to be
+        If BATCH_MODE Then CloseBatchIfDone
         Exit Sub
     End If
 
@@ -392,6 +399,9 @@ Private Sub PickUpNewExports()
         If fso.FileExists(dest) Then dest = destFolder & "\" & fso.GetBaseName(item) & "_" & Format$(Now, "hhnnss") & ".csv"
         fso.MoveFile folder & "\" & item, dest
     Next item
+    ' A new export from ECM: failed alerts get fresh automatic retry rounds.
+    On Error Resume Next
+    If fso.FileExists(RetryRoundFile()) Then fso.DeleteFile RetryRoundFile(), True
 End Sub
 
 ' Finds the first waiting alert (oldest csv first, then file order): one not in
@@ -657,7 +667,7 @@ Public Sub ECM_Queue_Status()
           "Case on the form (J9): " & IIf(Trim$(CStr(ThisWorkbook.Sheets("Sheet1").Range("J9").Value)) = "", "none", _
                                           ThisWorkbook.Sheets("Sheet1").Range("J9").Value) & vbCrLf & _
           "Alerts waiting: " & waiting & vbCrLf & _
-          "Failed alerts (after " & MAX_TRIES & " tries): " & FailedCount() & IIf(FailedCount() > 0, "  - Alt+F8 > ECM_Retry_Failed", "") & vbCrLf
+          "Failed alerts (after " & MAX_TRIES & " tries): " & FailedCount() & IIf(FailedCount() > 0, "  - retried automatically when the queue is empty (round " & Val(ReadAllText(RetryRoundFile())) & " of " & AUTO_RETRY_ROUNDS & " done)", "") & vbCrLf
     If waiting > 0 Then
         If LoadCsv(csv) = "" Then msg = msg & "Next: ECM " & Field(mRows(idx), mCEcm) & "  (from " & Mid$(csv, InStrRev(csv, "\") + 1) & ")" & vbCrLf
     End If
@@ -1393,8 +1403,8 @@ Private Sub CloseBatchIfDone()
     Application.StatusBar = "ECM batch done: " & n & " case(s) in " & zipFile
     TopMessage "ECM batch done - " & n & " case(s) zipped." & vbCrLf & vbCrLf & _
                IIf(Dir$(zipFile) <> "", zipFile, "The batch zip was not made - the case zips are in:" & vbCrLf & batchDir) & vbCrLf & vbCrLf & _
-               IIf(FailedCount() > 0, FailedCount() & " alert(s) FAILED after " & MAX_TRIES & " tries - see " & FAILED_LIST & _
-                   " in Downloads\" & IMPORTED_FOLDER & " (Alt+F8 > ECM_Retry_Failed to try them again)." & vbCrLf & vbCrLf, "") & _
+               IIf(FailedCount() > 0, FailedCount() & " alert(s) still FAILED after " & AUTO_RETRY_ROUNDS + 1 & " rounds of " & MAX_TRIES & _
+                   " tries - see " & FAILED_LIST & " in Downloads\" & IMPORTED_FOLDER & "." & vbCrLf & vbCrLf, "") & _
                "Per-case results: batch_summary.txt in the batch.", "ECM batch done", MB_ICONINFO
 End Sub
 
@@ -1574,7 +1584,7 @@ Private Function HandleFailedCase(ByVal ecm As String, ByVal tryNo As Long, ByVa
     End If
     AppendText DownloadsFolder() & "\" & IMPORTED_FOLDER & "\" & FAILED_LIST, _
                Format$(Now, "yyyy-mm-dd hh:nn") & vbTab & ecm & vbTab & "tries: " & tryNo & vbTab & reason
-    HandleFailedCase = "FAILED after " & tryNo & " tries - listed in " & FAILED_LIST & " (Alt+F8 > ECM_Retry_Failed)"
+    HandleFailedCase = "FAILED after " & tryNo & " tries - listed in " & FAILED_LIST & " (tried again automatically when the queue is empty)"
     WriteLog ecm, "FAILED (try " & tryNo & "): " & reason & " - given up, listed in " & FAILED_LIST
 End Function
 
@@ -1624,13 +1634,20 @@ Private Function FailedCount() As Long
     Next ln
 End Function
 
-' Alt+F8 > ECM_Retry_Failed: queue every alert in Failed_Alerts.txt again
-' (fresh tries). The list is kept as Failed_Alerts_retried_<time>.txt.
-Public Sub ECM_Retry_Failed()
-    Dim path As String, t As String, ln As Variant, parts() As String, ecm As String
-    Dim done As String, n As Long, bad As String
+' Queues every alert on the failed list again (fresh tries). The list is first
+' moved to Failed_Alerts_retried_<time>.txt, so with two copies only one does it.
+' Returns how many were queued; bad gets those whose row was not kept.
+Private Function RetryFailedList(ByRef bad As String) As Long
+    Dim path As String, taken As String, t As String, ln As Variant, parts() As String
+    Dim ecm As String, done As String
     path = DownloadsFolder() & "\" & IMPORTED_FOLDER & "\" & FAILED_LIST
-    t = ReadAllText(path)
+    If Dir$(path) = "" Then Exit Function
+    taken = Left$(path, Len(path) - 4) & "_retried_" & Format$(Now, "yyyymmdd_hhnnss") & ToolInstanceTag() & ".txt"
+    On Error Resume Next
+    CreateObject("Scripting.FileSystemObject").MoveFile path, taken
+    If Err.Number <> 0 Then Exit Function          ' the other copy took it
+    On Error GoTo 0
+    t = ReadAllText(taken)
     done = "|"
     For Each ln In Split(Replace(t, vbCr, ""), vbLf)
         parts = Split(ln & vbTab & vbTab, vbTab)
@@ -1638,17 +1655,54 @@ Public Sub ECM_Retry_Failed()
         If ecm <> "" And InStr(done, "|" & ecm & "|") = 0 Then
             done = done & ecm & "|"
             If RequeueAlert(ecm, 0) Then
-                n = n + 1
-                WriteLog ecm, "queued again by ECM_Retry_Failed"
+                RetryFailedList = RetryFailedList + 1
             Else
                 bad = bad & "   " & ecm & vbCrLf
             End If
         End If
     Next ln
-    If n = 0 And bad = "" Then MsgBox "No failed alerts.", vbInformation, "ECM retry": Exit Sub
+End Function
+
+Private Function RetryRoundFile() As String
+    RetryRoundFile = DownloadsFolder() & "\" & IMPORTED_FOLDER & "\auto_retry_round.txt"
+End Function
+
+' Queue empty: give the failed alerts another round by themselves. True while
+' it has queued them or is waiting for the cool-down (the batch stays open).
+Private Function AutoRetryFailed() As Boolean
+    Dim path As String, roundNo As Long, n As Long, bad As String, dueAt As Date
+    path = DownloadsFolder() & "\" & IMPORTED_FOLDER & "\" & FAILED_LIST
+    If FailedCount() = 0 Then Exit Function
+    roundNo = Val(ReadAllText(RetryRoundFile()))
+    If roundNo >= AUTO_RETRY_ROUNDS Then Exit Function       ' given up - the batch closes with them listed
     On Error Resume Next
-    CreateObject("Scripting.FileSystemObject").MoveFile path, Left$(path, Len(path) - 4) & "_retried_" & Format$(Now, "yyyymmdd_hhnnss") & ".txt"
+    dueAt = FileDateTime(path) + TimeSerial(0, RETRY_COOLDOWN_MIN, 0)
     On Error GoTo 0
+    If Now < dueAt Then
+        Application.StatusBar = "ECM auto-import: " & FailedCount() & " failed alert(s) - trying them again automatically at " & _
+                                Format$(dueAt, "hh:nn") & " (round " & roundNo + 1 & " of " & AUTO_RETRY_ROUNDS & ")."
+        AutoRetryFailed = True
+        Exit Function
+    End If
+    n = RetryFailedList(bad)
+    If n > 0 Or bad <> "" Then
+        With CreateObject("Scripting.FileSystemObject").CreateTextFile(RetryRoundFile(), True)
+            .Write CStr(roundNo + 1)
+            .Close
+        End With
+        WriteLog "-", "automatic retry round " & roundNo + 1 & " of " & AUTO_RETRY_ROUNDS & ": " & n & " failed alert(s) queued again" & _
+                      IIf(bad <> "", " (could not queue: " & Replace(Trim$(bad), vbCrLf, " ") & ")", "")
+    End If
+    AutoRetryFailed = (n > 0)
+End Function
+
+' Alt+F8 > ECM_Retry_Failed (optional - the queue also does it by itself):
+' queue every alert in Failed_Alerts.txt again now.
+Public Sub ECM_Retry_Failed()
+    Dim n As Long, bad As String
+    n = RetryFailedList(bad)
+    If n = 0 And bad = "" Then MsgBox "No failed alerts.", vbInformation, "ECM retry": Exit Sub
+    WriteLog "-", "ECM_Retry_Failed: " & n & " failed alert(s) queued again"
     MsgBox n & " failed alert(s) queued again - they load after the alerts already waiting." & _
            IIf(bad <> "", vbCrLf & vbCrLf & "Could not queue (alert row not kept - export them from ECM again):" & vbCrLf & bad, ""), _
            vbInformation, "ECM retry"
