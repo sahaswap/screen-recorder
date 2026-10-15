@@ -79,7 +79,7 @@ Option Explicit
 ' ==========================================================================
 
 Private Const PWD As String = "p7ss"
-Private Const ECM_IMPORT_VERSION As String = "2026-10-15m (two copies side by side)"
+Private Const ECM_IMPORT_VERSION As String = "2026-10-15n (close case workbooks by ECM number)"
 Private Const NOTIFY_WHEN_READY As Boolean = True ' on-top "case ready" message when a queued case loads
 ' On-top messages use the Windows MessageBox directly (VBA's MsgBox does not
 ' accept the "topmost" flag) - the same way the OSDD search prompts do, so the
@@ -489,6 +489,7 @@ Private Sub LoadQueued(ByVal ws As Worksheet, ByVal csv As String, ByVal idx As 
         If result = "" Then result = "export did not finish (see its message)"
     End If
     WriteLog ecmID, "step export: " & result
+    CloseCaseWorkbooks ecmID          ' safety net: nothing of the case left open
     If Left$(result, 2) = "OK" Then
         cpNote = FillCounterparties()
         WriteLog ecmID, "step counterparties: " & FirstLine(cpNote)
@@ -1041,6 +1042,21 @@ Private Function UrlEncodeAll(ByVal s As String) As String
     UrlEncodeAll = out
 End Function
 
+' Closes every open workbook belonging to a case - name starting "<ECM>_"
+' (Lookback, Combined, ...) - without saving (the export saved them). A safety
+' net that works whatever Module9 version is installed.
+Private Sub CloseCaseWorkbooks(ByVal ecmID As String)
+    Dim wb As Workbook, list As New Collection, item As Variant
+    If ecmID = "" Then Exit Sub
+    On Error Resume Next
+    For Each wb In Application.Workbooks
+        If wb.Name <> ThisWorkbook.Name And wb.Name Like ecmID & "_*" Then list.Add wb
+    Next wb
+    For Each item In list
+        item.Close SaveChanges:=False
+    Next item
+End Sub
+
 ' Closes an open workbook by full path, without saving (it was just saved).
 ' Matches by file name too: for files in OneDrive folders Excel reports
 ' FullName as a web address, not the C:\ path.
@@ -1217,6 +1233,7 @@ End Function
 Private Sub FinishCase(ByVal ws As Worksheet, ByVal timedOut As Boolean)
     Dim ecm As String, batchDir As String, zipFile As String, ok As Boolean, line As String
     ecm = mBatchWaitEcm
+    CloseCaseWorkbooks ecm
     Application.StatusBar = "ECM batch: zipping case " & ecm & "..."
     batchDir = CurrentBatchFolder()
     zipFile = batchDir & "\" & ecm & ".zip"
