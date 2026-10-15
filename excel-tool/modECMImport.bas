@@ -79,7 +79,7 @@ Option Explicit
 ' ==========================================================================
 
 Private Const PWD As String = "p7ss"
-Private Const ECM_IMPORT_VERSION As String = "2026-10-15q (failed alerts retried automatically)"
+Private Const ECM_IMPORT_VERSION As String = "2026-10-15r (timers: steps, case, batch)"
 ' Safety net: a case that fails (export / OSDD / narratives error, or Excel closed
 ' or crashed in the middle) is queued again at the end of the queue, up to
 ' MAX_TRIES tries in all. After that it is listed in ECM_Imported\Failed_Alerts.txt;
@@ -142,6 +142,9 @@ Private mBatchCaseResult As String
 Private mCaseTry As Long           ' try number of the case being worked (1 = first)
 Private mCaseFailed As String       ' why the current case failed ("" = it did not)
 Private mInCase As Boolean          ' LoadQueued is running
+Private mCaseStart As Date          ' timer: when the current case started loading
+Private mCaseDoneAt As Date         ' timer: when its steps finished (then the PDF merge wait)
+Private mStepTimes As String        ' timer: "export 1m 02s, OSDD 3m 40s, ..."
 Private mWaitEcm As String          ' alert waiting for its transaction file
 Private mWaitSince As Date
 
@@ -505,38 +508,53 @@ Private Sub LoadQueued(ByVal ws As Worksheet, ByVal csv As String, ByVal idx As 
     ThisWorkbook.Activate
     ws.Activate
     Application.StatusBar = "ECM auto-import: loading ECM " & ecmID & "..."
+    mCaseStart = Now
+    mCaseDoneAt = 0
+    mStepTimes = ""
+    If BATCH_MODE Then CurrentBatchFolder           ' starts the batch clock with the first case
+    Dim tStep As Date
 
     On Error GoTo Failed
+    tStep = Now
     copied = ImportRow(ws, idx, csv, note)
+    AddStepTime "load", tStep
     WriteLog ecmID, "step program: " & IIf(mProgramNote = "", "(no program line)", mProgramNote)
     If copied = "" Then
         result = "transaction file not found in Downloads"
     ElseIf AUTO_EXPORT_MODE = "" Then
         result = "OK"
     Else
+        tStep = Now
         result = RunAutoExport(ecmID, True)
         If result = "" Then result = "export did not finish (see its message)"
+        AddStepTime "export", tStep
     End If
-    WriteLog ecmID, "step export: " & result
+    WriteLog ecmID, "step export: " & result & " (" & Dur(tStep) & ")"
     CloseCaseWorkbooks ecmID          ' safety net: nothing of the case left open
     If Left$(result, 2) = "OK" Then
+        tStep = Now
         cpNote = FillCounterparties()
-        WriteLog ecmID, "step counterparties: " & FirstLine(cpNote)
+        AddStepTime "counterparties", tStep
+        WriteLog ecmID, "step counterparties: " & FirstLine(cpNote) & " (" & Dur(tStep) & ")"
         If AUTO_OSDD Then
-            Application.StatusBar = "ECM " & ecmID & ": running OSDD search (Option 2)..."
+            Application.StatusBar = "ECM " & ecmID & ": running OSDD search (Option 2)... [case so far " & Dur(mCaseStart) & "]"
             WriteLog ecmID, "step OSDD: started"
+            tStep = Now
             osddNote = RunAutoOsdd()
+            AddStepTime "OSDD", tStep
             cpNote = cpNote & vbCrLf & osddNote
-            WriteLog ecmID, "step OSDD: " & FirstLine(osddNote)
+            WriteLog ecmID, "step OSDD: " & FirstLine(osddNote) & " (" & Dur(tStep) & ")"
             If InStr(osddNote, "stopped with an error") > 0 Or InStr(osddNote, "did not finish") > 0 Then _
                 mCaseFailed = FirstLine(osddNote)
         End If
         If AUTO_NARRATIVES Then
-            Application.StatusBar = "ECM " & ecmID & ": generating narratives..."
+            Application.StatusBar = "ECM " & ecmID & ": generating narratives... [case so far " & Dur(mCaseStart) & "]"
             WriteLog ecmID, "step narratives: started"
+            tStep = Now
             narrNote = RunAutoNarratives(ws)
+            AddStepTime "narratives", tStep
             cpNote = cpNote & vbCrLf & narrNote
-            WriteLog ecmID, "step narratives: " & Replace(Replace(narrNote, vbCrLf, " "), "   ", " ")
+            WriteLog ecmID, "step narratives: " & Replace(Replace(narrNote, vbCrLf, " "), "   ", " ") & " (" & Dur(tStep) & ")"
             If mCaseFailed = "" And (InStr(narrNote, "stopped with an error") > 0 Or InStr(narrNote, "not saved") > 0) Then _
                 mCaseFailed = "narratives: " & Replace(Replace(narrNote, vbCrLf, " "), "   ", " ")
         End If
@@ -557,7 +575,8 @@ Failed:
     Resume Report
 
 Report:
-    WriteLog ecmID, result
+    mCaseDoneAt = Now
+    WriteLog ecmID, result & "  [steps took " & Dur(mCaseStart) & ": " & mStepTimes & "]"
     If Left$(result, 2) <> "OK" And mCaseFailed = "" Then mCaseFailed = result
     mInCase = False
     If mCaseFailed = "" Then
@@ -575,16 +594,17 @@ Report:
         mBatchWaitSince = Now
         WriteBatchWait ecmID
         mBatchCaseResult = result & IIf(mProgramNote <> "", " | " & mProgramNote, "")
-        Application.StatusBar = "ECM batch: case " & ecmID & " done - waiting for its merged PDFs, then zip and next (" & _
-                                stillWaiting & " more waiting)."
+        Application.StatusBar = "ECM batch: case " & ecmID & " done in " & Dur(mCaseStart) & _
+                                " - waiting for its merged PDFs, then zip and next (" & stillWaiting & " more waiting)."
         Exit Sub
     End If
     PrepareToolWindow ws
     If Left$(result, 2) = "OK" Then
-        Application.StatusBar = "ECM " & ecmID & IIf(result = "OK", " loaded and exported. ", " loaded (EN files already existed, not recreated). ") & _
+        Application.StatusBar = "ECM " & ecmID & IIf(result = "OK", " loaded and exported", " loaded (EN files already existed, not recreated)") & _
+            " in " & Dur(mCaseStart) & ". " & _
             IIf(stillWaiting > 0, stillWaiting & " more waiting - press Reset when done to load the next.", "No more alerts waiting.")
         If NOTIFY_WHEN_READY Then
-            TopMessage "ECM case " & ecmID & " is ready in the tool." & vbCrLf & _
+            TopMessage "ECM case " & ecmID & " is ready in the tool (took " & Dur(mCaseStart) & ")." & vbCrLf & _
                        IIf(stillWaiting > 0, stillWaiting & " more waiting after this one.", "No more alerts waiting.") & vbCrLf & vbCrLf & _
                        IIf(mProgramNote <> "", mProgramNote & vbCrLf & vbCrLf, "") & _
                        IIf(cpNote <> "", cpNote & vbCrLf, "") & _
@@ -1329,7 +1349,8 @@ Private Sub FinishCase(ByVal ws As Worksheet, ByVal timedOut As Boolean)
     If mCaseFailed <> "" Then
         ' Failed case: not zipped - queued again (or listed as failed).
         line = HandleFailedCase(ecm, mCaseTry, mCaseFailed)
-        AppendText batchDir & "\batch_summary.txt", ecm & vbTab & "FAILED (try " & mCaseTry & "): " & mCaseFailed & vbTab & line
+        AppendText batchDir & "\batch_summary.txt", ecm & vbTab & "FAILED (try " & mCaseTry & "): " & mCaseFailed & vbTab & line & _
+                   vbTab & CaseTimeText()
         ClearInProgress
         mCaseFailed = ""
         mBatchWaitEcm = ""
@@ -1344,8 +1365,10 @@ Private Sub FinishCase(ByVal ws As Worksheet, ByVal timedOut As Boolean)
     ok = MakeZip("ZIP_" & ecm, CaseFolderPath(ecm), zipFile)
     line = ecm & vbTab & IIf(mBatchCaseResult = "", "?", mBatchCaseResult) & _
            IIf(timedOut, vbTab & "merged PDFs not finished after " & MERGE_WAIT_MIN & " min (is Merge Watcher running?)", "") & _
-           vbTab & IIf(ok, IIf(UCase$(ZIP_MODE) = "WATCHER", "zip requested", "zipped"), "ZIP FAILED")
+           vbTab & IIf(ok, IIf(UCase$(ZIP_MODE) = "WATCHER", "zip requested", "zipped"), "ZIP FAILED") & _
+           vbTab & CaseTimeText()
     AppendText batchDir & "\batch_summary.txt", line
+    WriteLog ecm, "case time: " & CaseTimeText()
     WriteLog ecm, "step zip: " & IIf(ok, zipFile, "FAILED - " & zipFile) & IIf(timedOut, " (merge wait timed out)", "")
     mBatchWaitEcm = ""
     mBatchCaseResult = ""
@@ -1399,9 +1422,13 @@ Private Sub CloseBatchIfDone()
     On Error Resume Next
     Kill lockFile
     On Error GoTo 0
-    WriteLog "-", "batch zip: " & IIf(Dir$(zipFile) <> "", zipFile, "NOT MADE - " & zipFile) & " (" & n & " case zip(s))"
-    Application.StatusBar = "ECM batch done: " & n & " case(s) in " & zipFile
+    Dim batchTime As String
+    batchTime = BatchTimeText(batchDir, n)
+    AppendText batchDir & "\batch_summary.txt", "BATCH TIME" & vbTab & batchTime
+    WriteLog "-", "batch zip: " & IIf(Dir$(zipFile) <> "", zipFile, "NOT MADE - " & zipFile) & " (" & n & " case zip(s)) - " & batchTime
+    Application.StatusBar = "ECM batch done: " & n & " case(s) in " & zipFile & " - " & batchTime
     TopMessage "ECM batch done - " & n & " case(s) zipped." & vbCrLf & vbCrLf & _
+               "Time: " & batchTime & vbCrLf & vbCrLf & _
                IIf(Dir$(zipFile) <> "", zipFile, "The batch zip was not made - the case zips are in:" & vbCrLf & batchDir) & vbCrLf & vbCrLf & _
                IIf(FailedCount() > 0, FailedCount() & " alert(s) still FAILED after " & AUTO_RETRY_ROUNDS + 1 & " rounds of " & MAX_TRIES & _
                    " tries - see " & FAILED_LIST & " in Downloads\" & IMPORTED_FOLDER & "." & vbCrLf & vbCrLf, "") & _
@@ -1443,6 +1470,7 @@ Private Function CurrentBatchFolder() As String
         If Not fso.FolderExists(p) Then fso.CreateFolder p
         p = p & "\Batch_" & Format$(Now, "yyyymmdd_hhnn")
         If Not fso.FolderExists(p) Then fso.CreateFolder p
+        AppendText p & "\batch_started.txt", Format$(Now, "yyyy-mm-dd hh:nn:ss")   ' batch clock
         Dim ts As Object
         Set ts = fso.CreateTextFile(flag, True)
         ts.WriteLine p                ' own line - "ZIPPING" may be appended later
@@ -1516,6 +1544,55 @@ Public Function ToolInstanceTag() As String
         done = True
     End If
     ToolInstanceTag = tag
+End Function
+
+' ==========================================================================
+' TIMERS
+' ==========================================================================
+' 75 s -> "1m 15s", 3700 s -> "1h 01m". toT defaults to now.
+Private Function Dur(ByVal fromT As Date, Optional ByVal toT As Date = 0) As String
+    Dim secs As Long
+    If fromT = 0 Then Dur = "?": Exit Function
+    If toT = 0 Then toT = Now
+    secs = CLng((toT - fromT) * 86400#)
+    If secs < 0 Then secs = 0
+    If secs >= 3600 Then
+        Dur = secs \ 3600 & "h " & Format$((secs Mod 3600) \ 60, "00") & "m"
+    ElseIf secs >= 60 Then
+        Dur = secs \ 60 & "m " & Format$(secs Mod 60, "00") & "s"
+    Else
+        Dur = secs & "s"
+    End If
+End Function
+
+Private Sub AddStepTime(ByVal stepName As String, ByVal fromT As Date)
+    mStepTimes = mStepTimes & IIf(mStepTimes = "", "", ", ") & stepName & " " & Dur(fromT)
+End Sub
+
+' "case 6m 40s (load 2s, export 1m 05s, ..., PDF merge wait 35s)"
+Private Function CaseTimeText() As String
+    If mCaseStart = 0 Then CaseTimeText = "case time unknown (Excel restarted)": Exit Function
+    CaseTimeText = "case " & Dur(mCaseStart) & " (" & mStepTimes & _
+                   IIf(mCaseDoneAt <> 0, IIf(mStepTimes = "", "", ", ") & "PDF merge wait " & Dur(mCaseDoneAt), "") & ")"
+End Function
+
+' "whole batch 1h 05m for 12 case(s) - average 5m 25s per case"
+Private Function BatchTimeText(ByVal batchDir As String, ByVal cases As Long) As String
+    Dim t As String, started As Date, secs As Double
+    t = Trim$(Split(Replace(ReadAllText(batchDir & "\batch_started.txt"), vbCr, "") & vbLf, vbLf)(0))
+    If Len(t) < 19 Then BatchTimeText = "whole batch time unknown": Exit Function
+    On Error GoTo Bad
+    started = DateSerial(Val(Mid$(t, 1, 4)), Val(Mid$(t, 6, 2)), Val(Mid$(t, 9, 2))) + _
+              TimeSerial(Val(Mid$(t, 12, 2)), Val(Mid$(t, 15, 2)), Val(Mid$(t, 18, 2)))
+    BatchTimeText = "whole batch " & Dur(started) & " for " & cases & " case(s)"
+    If cases > 0 Then
+        secs = (Now - started) * 86400# / cases
+        BatchTimeText = BatchTimeText & " - average " & Dur(Now - secs / 86400#) & " per case" & _
+                        " (started " & Format$(started, "hh:nn") & ", finished " & Format$(Now, "hh:nn") & ")"
+    End If
+    Exit Function
+Bad:
+    BatchTimeText = "whole batch time unknown"
 End Function
 
 ' ==========================================================================
