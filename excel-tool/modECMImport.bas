@@ -28,7 +28,9 @@ Option Explicit
 '      their defaults, Sigma "additional address" = No) - AUTO_OSDD;
 '   7. generates both narratives with the Wise template - Escalation, then
 '      Non-Escalation (Module3 quiet mode) - AUTO_NARRATIVES. Decision/Template
-'      are cleared afterwards so the analyst still makes the call; J7 is kept.
+'      are cleared afterwards so the analyst still makes the call; J7 is kept;
+'   8. starts the Power Automate flow "Merge All OSDD" once (run link in
+'      Backend_Settings!B5) to merge every entity's OSDD PDFs - AUTO_MERGE.
 '
 ' Failsafe - nothing already made for a case is made again:
 '   - a Transaction Files folder that already has an Excel file is not copied into;
@@ -68,7 +70,7 @@ Option Explicit
 ' ==========================================================================
 
 Private Const PWD As String = "p7ss"
-Private Const ECM_IMPORT_VERSION As String = "2026-10-15a (program kept for narratives)"
+Private Const ECM_IMPORT_VERSION As String = "2026-10-15b (auto PDF merge)"
 Private Const NOTIFY_WHEN_READY As Boolean = True ' on-top "case ready" message when a queued case loads
 ' On-top messages use the Windows MessageBox directly (VBA's MsgBox does not
 ' accept the "topmost" flag) - the same way the OSDD search prompts do, so the
@@ -83,6 +85,8 @@ Private Const AUTO_EXPORT_MODE As String = "EN"   ' "EN" / "LEGACY" / "PIVOT" / 
 Private Const AUTO_OSDD As Boolean = True          ' run the OSDD search (Option 2) after sampling
 Private Const AUTO_NARRATIVES As Boolean = True    ' generate the Escalation and Non-Escalation narratives
 Private Const NARR_TEMPLATE As String = "Wise"     ' template (J6) used for both narratives
+Private Const AUTO_MERGE As Boolean = True         ' start the "Merge All OSDD" Power Automate flow at the end
+Private Const MERGE_URL_CELL As String = "B5"      ' Backend_Settings cell holding that flow's run link
 Private Const WATCH_SECONDS As Long = 10          ' how often Downloads is checked
 Private Const BUSY_TIMEOUT_MIN As Long = 45       ' a check running longer than this is treated as stuck (OSDD can take a while)
 Private Const FILE_WAIT_SECONDS As Long = 120     ' how long to wait for a transaction file still downloading
@@ -147,6 +151,7 @@ Public Sub Import_ECM_Info()
             cpNote = FillCounterparties()
             If AUTO_OSDD Then cpNote = cpNote & vbCrLf & RunAutoOsdd()
             If AUTO_NARRATIVES Then cpNote = cpNote & vbCrLf & RunAutoNarratives(ws)
+            If AUTO_MERGE Then cpNote = cpNote & vbCrLf & RunAutoMerge(ws)
             Application.StatusBar = Replace(Split(cpNote & vbCrLf, vbCrLf)(0), vbTab, " ")
         End If
         If result <> "OK" And Left$(result, 2) = "OK" Then
@@ -385,7 +390,7 @@ End Function
 ' for the analyst. Only a failure shows a message.
 Private Sub LoadQueued(ByVal ws As Worksheet, ByVal csv As String, ByVal idx As Long, ByVal stillWaiting As Long)
     Dim ecmID As String, note As String, copied As String, result As String, cpNote As String
-    Dim osddNote As String, narrNote As String
+    Dim osddNote As String, narrNote As String, mergeNote As String
 
     If LoadCsv(csv) <> "" Then Exit Sub
     ecmID = Field(mRows(idx), mCEcm)
@@ -434,6 +439,11 @@ Private Sub LoadQueued(ByVal ws As Worksheet, ByVal csv As String, ByVal idx As 
             narrNote = RunAutoNarratives(ws)
             cpNote = cpNote & vbCrLf & narrNote
             WriteLog ecmID, "step narratives: " & Replace(Replace(narrNote, vbCrLf, " "), "   ", " ")
+        End If
+        If AUTO_MERGE Then
+            mergeNote = RunAutoMerge(ws)
+            cpNote = cpNote & vbCrLf & mergeNote
+            WriteLog ecmID, "step merge: " & Replace(mergeNote, vbCrLf, " ")
         End If
     Else
         WriteLog ecmID, "steps after the export skipped (export not OK)"
@@ -808,6 +818,71 @@ Private Sub RestoreDecision(ByVal ws As Worksheet, ByVal prog As String)
     ProtectSheet ws
     Application.CalculateFull
 End Sub
+
+' Step 8: start the "Merge All OSDD" Power Automate flow once for the case. Its
+' inputs: ECMCase, AlertID, OsddFolder (Desktop\<ECM>\OSDD Searches) and Entities,
+' "Customer|<customer name>;CP1|CP1_<name>;CP2|CP2_<name>..." - for each entry the
+' flow merges the OSDD PDFs whose names contain "_Customer_" / "_CP1_" ... into
+' <case folder>\<ECM>_<Alert>_<second part>_MergedOSDD.pdf (same names as the
+' PDF Merge button). The flow runs on its own; Excel does not wait for it.
+Private Function RunAutoMerge(ByVal ws As Worksheet) As String
+    Dim url As String, ents As String, r As Long, nm As String, ecm As String, json As String
+    On Error GoTo Fail
+    url = Trim$(CStr(ThisWorkbook.Sheets("Backend_Settings").Range(MERGE_URL_CELL).Value))
+    If url = "" Then
+        RunAutoMerge = "PDF merge not started - put the ""Merge All OSDD"" flow's run link in Backend_Settings!" & MERGE_URL_CELL & "."
+        Exit Function
+    End If
+    ecm = Trim$(CStr(ws.Range("J9").Value))
+    nm = SafeEntity(CStr(ws.Range("J13").Value))
+    If nm <> "" Then ents = "Customer|" & nm
+    For r = 18 To 23
+        nm = SafeEntity(CStr(ws.Cells(r, "J").Value))
+        If nm <> "" Then ents = ents & IIf(ents = "", "", ";") & "CP" & (r - 17) & "|CP" & (r - 17) & "_" & nm
+    Next r
+    If ents = "" Then RunAutoMerge = "PDF merge not started - no customer or counterparty names on Sheet1.": Exit Function
+
+    json = "{""ECMCase"":""" & JsonText(ecm) & """,""AlertID"":""" & JsonText(CStr(ws.Range("J10").Value)) & _
+           """,""OsddFolder"":""" & JsonText(CaseFolderPath(ecm) & "\OSDD Searches") & _
+           """,""Entities"":""" & JsonText(ents) & """}"
+    url = url & IIf(InStr(url, "?") > 0, "&", "?") & "inputArguments=" & UrlEncodeAll(json)
+    CreateObject("Shell.Application").ShellExecute url
+    RunAutoMerge = "PDF merge started in Power Automate for: " & Replace(Replace(ents, ";", ", "), "|", " -> ")
+    Exit Function
+Fail:
+    RunAutoMerge = "PDF merge not started (" & Err.Description & ") - use the PDF Merge button."
+End Function
+
+' Name usable in a file name and in the Entities list.
+Private Function SafeEntity(ByVal s As String) As String
+    Dim ch As Variant
+    For Each ch In Array("\", "/", ":", "*", "?", """", "<", ">", "|", ";", vbCr, vbLf, vbTab)
+        s = Replace(s, ch, " ")
+    Next ch
+    SafeEntity = Application.WorksheetFunction.Trim(s)
+End Function
+
+Private Function JsonText(ByVal s As String) As String
+    JsonText = Replace(Replace(Trim$(s), "\", "\\"), """", "\""")
+End Function
+
+' Percent-encodes everything except letters and digits (UTF-8).
+Private Function UrlEncodeAll(ByVal s As String) As String
+    Dim i As Long, code As Long, out As String
+    For i = 1 To Len(s)
+        code = AscW(Mid$(s, i, 1)) And 65535
+        If (code >= 48 And code <= 57) Or (code >= 65 And code <= 90) Or (code >= 97 And code <= 122) Then
+            out = out & ChrW(code)
+        ElseIf code < 128 Then
+            out = out & "%" & Right$("0" & Hex(code), 2)
+        ElseIf code < 2048 Then
+            out = out & "%" & Hex(192 + code \ 64) & "%" & Hex(128 + (code And 63))
+        Else
+            out = out & "%" & Hex(224 + code \ 4096) & "%" & Hex(128 + ((code \ 64) And 63)) & "%" & Hex(128 + (code And 63))
+        End If
+    Next i
+    UrlEncodeAll = out
+End Function
 
 ' Closes an open workbook by full path, without saving (it was just saved).
 Public Sub CloseSavedExport(ByVal fullPath As String)

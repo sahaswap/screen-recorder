@@ -1,0 +1,69 @@
+MERGE ALL OSDD - Power Automate Desktop flow
+=============================================
+Started by the tool (modECMImport, step 8) once per case. Merges every entity's
+OSDD PDFs with no file dialog and no message box. Your existing PDF Merge flow
+and button are not changed.
+
+For each entity it takes the PDFs in "OSDD Searches" whose names contain
+_Customer_ / _CP1_ / _CP2_ ..., sorts them by name (descending, like your
+current flow) and merges them into the case folder as
+  <ECM>_<Alert>_<Customer name>_MergedOSDD.pdf
+  <ECM>_<Alert>_CP1_<name>_MergedOSDD.pdf   ... (same names as today)
+
+
+ONE-TIME SETUP
+--------------
+1. Power Automate Desktop > + New flow > name it:  Merge All OSDD
+
+2. Variables pane (right side) > Input / output variables > + > Input, four times:
+       Variable name     Data type   Default value (only for testing)
+       ECMCase           Text        149305
+       AlertID           Text        ALERT2389104
+       OsddFolder        Text        C:\Users\<you>\OneDrive - Community Federal Savings Bank\Desktop\149305\OSDD Searches
+       Entities          Text        Customer|Alexa Silverberg;CP1|CP1_The Twenty Two New York
+   The names must be exactly these (they are what Excel sends).
+
+3. Click in the empty flow area, press Ctrl+V with the script below copied
+   (everything between the ----- lines). The actions appear in the flow.
+   If any line shows a red error, tell me which one.
+
+4. Save. Click Run once with the test defaults and check the merged PDFs
+   appear in the case folder.
+
+5. Get the flow's run link: Power Automate Desktop console > the flow's "..." >
+   Properties > Details > "Run URL" - copy it.
+   In the tool, sheet Backend_Settings:  A5 = Flow_MergeAll   B5 = <the run link>
+   (B4 keeps your existing PDF Merge flow.)
+
+6. The first time Excel starts it, Windows / Power Automate may ask to allow
+   running the flow from a link - allow it (tick "always" if offered).
+
+
+SCRIPT (copy from the line after ----- to the line before -----)
+-----
+Text.SplitText.SplitWithDelimiter Text: Entities CustomDelimiter: $''';''' IsRegEx: False Result=> EntityList
+LOOP FOREACH Entry IN EntityList
+    Text.SplitText.SplitWithDelimiter Text: Entry CustomDelimiter: $'''|''' IsRegEx: False Result=> Parts
+    SET Prefix TO Parts[0]
+    SET OutName TO Parts[1]
+    Folder.GetFiles Folder: OsddFolder FileFilter: $'''*_%Prefix%_*.pdf''' IncludeSubfolders: False FailOnAccessDenied: False SortBy1: Folder.SortBy.Name SortDescending1: True SortBy2: Folder.SortBy.NoSort SortDescending2: False SortBy3: Folder.SortBy.NoSort SortDescending3: False Files=> Files
+    IF Files.Count > 0 THEN
+        Pdf.MergeFiles PDFFiles: Files MergedPDFPath: $'''%OsddFolder%\\..\\%ECMCase%_%AlertID%_%OutName%_MergedOSDD.pdf''' IfFileExists: Pdf.IfFileExists.Overwrite PasswordDelimiter: $''',''' MergedPDF=> MergedPDF
+    END
+END
+-----
+
+
+IF PASTING DOES NOT WORK - build it by hand (same 6 actions):
+  1. Text > Split text:  Text to split = %Entities%, Separator type = Custom,
+     Custom delimiter = ;   -> produces EntityList
+  2. Loops > For each:  Value to iterate = %EntityList%, store into = Entry
+  3.   (inside the loop) Text > Split text:  Text = %Entry%, Custom delimiter = |
+       -> produces Parts
+  4.   Variables > Set variable:  Prefix = %Parts[0]%   and again  OutName = %Parts[1]%
+  5.   Folder > Get files in folder:  Folder = %OsddFolder%,
+       File filter = *_%Prefix%_*.pdf, Sort by = Name, Descending  -> Files
+  6.   Conditionals > If %Files.Count% > 0:
+         PDF > Merge PDF files:  PDF files = %Files%,
+         Merged PDF path = %OsddFolder%\..\%ECMCase%_%AlertID%_%OutName%_MergedOSDD.pdf,
+         If file exists = Overwrite
