@@ -72,7 +72,7 @@ Option Explicit
 ' ==========================================================================
 
 Private Const PWD As String = "p7ss"
-Private Const ECM_IMPORT_VERSION As String = "2026-10-15c (merge watcher)"
+Private Const ECM_IMPORT_VERSION As String = "2026-10-15d (merge watcher, simple)"
 Private Const NOTIFY_WHEN_READY As Boolean = True ' on-top "case ready" message when a queued case loads
 ' On-top messages use the Windows MessageBox directly (VBA's MsgBox does not
 ' accept the "topmost" flag) - the same way the OSDD search prompts do, so the
@@ -197,6 +197,7 @@ End Sub
 
 Public Sub StartEcmWatcher()
     On Error Resume Next
+    MergeRequestFolder              ' so the Merge Watcher flow always finds its folder
     mWatching = True
     ScheduleTick
     Application.StatusBar = "ECM auto-import is on - the next waiting alert loads whenever the form is empty."
@@ -862,33 +863,65 @@ Fail:
 End Function
 
 ' MERGE_MODE "WATCH": hand the merge to the "Merge Watcher" flow, which runs all
-' day in Power Automate (started once from its console - no confirmation) and
-' picks up request files. One request = Downloads\ECM_Imported\MergeRequests\
-' <ECM>.txt with four lines: ECMCase, AlertID, OsddFolder, Entities. Written as
-' .tmp and then renamed, so the flow never reads a half-written file.
+' day in Power Automate (started once from its console - no confirmation). One
+' request file per entity that has OSDD PDFs:
+'   Downloads\ECM_Imported\MergeRequests\<ECM>_<Customer|CP1..CP6>.txt
+' with three lines - the OSDD Searches folder, the file filter (*_CP1_*.pdf) and
+' the merged PDF's full path - so the flow only has to read, merge and delete.
+' Each file is written as .tmp and then renamed, so the flow never reads a
+' half-written one.
 Private Function QueueMergeRequest(ByVal ecm As String, ByVal alertId As String, _
                                    ByVal osddFolder As String, ByVal ents As String) As String
-    Dim fso As Object, dirPath As String, tmp As String, fin As String, st As Object
+    Dim fso As Object, dirPath As String, e As Variant, pre As String, outName As String
+    Dim filt As String, merged As String, queued As String, skipped As String
     On Error GoTo Fail
     Set fso = CreateObject("Scripting.FileSystemObject")
-    dirPath = DownloadsFolder() & "\" & IMPORTED_FOLDER
-    If Not fso.FolderExists(dirPath) Then fso.CreateFolder dirPath
-    dirPath = dirPath & "\MergeRequests"
-    If Not fso.FolderExists(dirPath) Then fso.CreateFolder dirPath
-    tmp = dirPath & "\" & ecm & ".tmp"
-    fin = dirPath & "\" & ecm & ".txt"
+    dirPath = MergeRequestFolder()
+    For Each e In Split(ents, ";")
+        pre = Split(e, "|")(0): outName = Split(e, "|")(1)
+        filt = "*_" & pre & "_*.pdf"
+        If Dir$(osddFolder & "\" & filt) = "" Then
+            skipped = skipped & IIf(skipped = "", "", ", ") & pre
+        Else
+            merged = fso.GetParentFolderName(osddFolder) & "\" & ecm & "_" & alertId & "_" & outName & "_MergedOSDD.pdf"
+            WriteRequest dirPath, ecm & "_" & pre, osddFolder & vbCrLf & filt & vbCrLf & merged & vbCrLf
+            queued = queued & IIf(queued = "", "", ", ") & outName
+        End If
+    Next e
+    If queued = "" Then
+        QueueMergeRequest = "PDF merge: no OSDD PDFs found in " & osddFolder & " - nothing to merge."
+    Else
+        QueueMergeRequest = "PDF merge queued for the Merge Watcher flow: " & queued & _
+                            IIf(skipped <> "", " (no PDFs for " & skipped & ")", "")
+    End If
+    Exit Function
+Fail:
+    QueueMergeRequest = "PDF merge request could not be written (" & Err.Description & ") - use the PDF Merge button."
+End Function
+
+Private Sub WriteRequest(ByVal dirPath As String, ByVal baseName As String, ByVal body As String)
+    Dim fso As Object, st As Object, tmp As String, fin As String
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    tmp = dirPath & "\" & baseName & ".tmp"
+    fin = dirPath & "\" & baseName & ".txt"
     Set st = CreateObject("ADODB.Stream")
     st.Type = 2: st.Charset = "utf-8": st.Open
-    st.WriteText ecm & vbCrLf & alertId & vbCrLf & osddFolder & vbCrLf & ents & vbCrLf
+    st.WriteText body
     st.SaveToFile tmp, 2
     st.Close
     If fso.FileExists(fin) Then fso.DeleteFile fin, True
     fso.MoveFile tmp, fin
-    QueueMergeRequest = "PDF merge queued for the Merge Watcher flow (start it once a day in Power Automate) for: " & _
-                        Replace(Replace(ents, ";", ", "), "|", " -> ")
-    Exit Function
-Fail:
-    QueueMergeRequest = "PDF merge request could not be written (" & Err.Description & ") - use the PDF Merge button."
+End Sub
+
+' Downloads\ECM_Imported\MergeRequests, created if missing.
+Private Function MergeRequestFolder() As String
+    Dim fso As Object, p As String
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    p = DownloadsFolder() & "\" & IMPORTED_FOLDER
+    If Not fso.FolderExists(p) Then fso.CreateFolder p
+    p = p & "\MergeRequests"
+    If Not fso.FolderExists(p) Then fso.CreateFolder p
+    MergeRequestFolder = p
 End Function
 
 ' Name usable in a file name and in the Entities list.
