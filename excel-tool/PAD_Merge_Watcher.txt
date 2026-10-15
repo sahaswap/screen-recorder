@@ -74,6 +74,10 @@ Text in %...% is typed exactly as shown (the % signs included).
 10. "Wait"   (after the For each's End, still inside the Loop condition)
         Duration:  5   (seconds)
 
+RECOMMENDED: in "Merge PDF files" and "Delete file(s)" open "On error" (bottom
+left of the action) > Continue flow run > Go to next action. Then a locked or
+open file skips that one request instead of stopping the watcher.
+
 Save, then Run. Leave it running.
 
 Finished flow should read:
@@ -103,7 +107,7 @@ System.GetEnvironmentVariable.GetEnvironmentVariable Name: $'''USERPROFILE''' Va
 LOOP WHILE (1) = (1)
     Folder.GetFiles Folder: $'''%EnvironmentVariableValue%\\Downloads\\ECM_Imported\\MergeRequests''' FileFilter: $'''*.txt''' IncludeSubfolders: False FailOnAccessDenied: False SortBy1: Folder.SortBy.CreationTime SortDescending1: False SortBy2: Folder.SortBy.NoSort SortDescending2: False SortBy3: Folder.SortBy.NoSort SortDescending3: False Files=> Requests
     LOOP FOREACH CurrentItem IN Requests
-        File.ReadTextFromFile.ReadTextIntoList File: CurrentItem Encoding: File.TextFileEncoding.UTF8 Contents=> FileContents
+        File.ReadTextFromFile.ReadTextAsList File: CurrentItem Encoding: File.TextFileEncoding.UTF8 Contents=> FileContents
         Folder.GetFiles Folder: FileContents[0] FileFilter: FileContents[1] IncludeSubfolders: False FailOnAccessDenied: False SortBy1: Folder.SortBy.Name SortDescending1: True SortBy2: Folder.SortBy.NoSort SortDescending2: False SortBy3: Folder.SortBy.NoSort SortDescending3: False Files=> Files
         IF Files.Count > 0 THEN
             Pdf.MergeFiles PDFFiles: Files MergedPDFPath: FileContents[2] IfFileExists: Pdf.IfFileExists.Overwrite PasswordDelimiter: $''',''' MergedPDF=> MergedPDF

@@ -72,7 +72,7 @@ Option Explicit
 ' ==========================================================================
 
 Private Const PWD As String = "p7ss"
-Private Const ECM_IMPORT_VERSION As String = "2026-10-15d (merge watcher, simple)"
+Private Const ECM_IMPORT_VERSION As String = "2026-10-15e (merge requests without BOM)"
 Private Const NOTIFY_WHEN_READY As Boolean = True ' on-top "case ready" message when a queued case loads
 ' On-top messages use the Windows MessageBox directly (VBA's MsgBox does not
 ' accept the "topmost" flag) - the same way the OSDD search prompts do, so the
@@ -899,15 +899,24 @@ Fail:
     QueueMergeRequest = "PDF merge request could not be written (" & Err.Description & ") - use the PDF Merge button."
 End Function
 
+' UTF-8 WITHOUT the byte-order mark, so line 1 (the folder path) has no hidden
+' character in front of it when Power Automate reads the file.
 Private Sub WriteRequest(ByVal dirPath As String, ByVal baseName As String, ByVal body As String)
-    Dim fso As Object, st As Object, tmp As String, fin As String
+    Dim fso As Object, st As Object, bin As Object, tmp As String, fin As String
     Set fso = CreateObject("Scripting.FileSystemObject")
     tmp = dirPath & "\" & baseName & ".tmp"
     fin = dirPath & "\" & baseName & ".txt"
     Set st = CreateObject("ADODB.Stream")
     st.Type = 2: st.Charset = "utf-8": st.Open
     st.WriteText body
-    st.SaveToFile tmp, 2
+    st.Position = 0
+    st.Type = 1                       ' switch to bytes and skip the 3-byte BOM
+    st.Position = 3
+    Set bin = CreateObject("ADODB.Stream")
+    bin.Type = 1: bin.Open
+    st.CopyTo bin
+    bin.SaveToFile tmp, 2
+    bin.Close
     st.Close
     If fso.FileExists(fin) Then fso.DeleteFile fin, True
     fso.MoveFile tmp, fin
