@@ -1,11 +1,13 @@
 /*
   ECM Transactions Export
-  For each alert ID (ECM case ID):
+  Two buttons, each working through the alert IDs (ECM case IDs) in the box.
+  "Export transactions", for each alert:
     1. reads Customer Name, Customer Internal ID, current and permanent address, and Velocity Alert ID from the Requirements page;
     2. runs "Export Transactions" on the Statistics page, saving the file to Downloads as
        <ECM ID>_<Velocity Alert ID>_<original file name>;
-    3. reads the Alert Analyst Decision and the Alert Narrative from the Requirements page;
-  then saves ECM_Alert_Info_<date>.csv (one row per alert) for the Excel tool, and
+  then saves ECM_Alert_Info_<date>.csv (one row per alert) for the Excel tool.
+  "Get narratives", for each alert, reads the Velocity Alert ID, Customer Name, Alert Analyst
+  Decision and Alert Narrative from the Requirements page, with no export, then saves
   ECM_Narratives_<date>.xlsx (one row per alert, the narrative in full).
   Run on any ECM page while logged in: paste into the Console (Ctrl+Shift+J) or use the bookmarklet.
   Uses your existing Edge session - no passwords are stored or sent anywhere else.
@@ -13,7 +15,7 @@
 (function () {
   if (document.getElementById('__ecmExport')) return;
 
-  var VERSION = '2026-11-13 (with Narratives)';   /* shown in the panel title */
+  var VERSION = '2026-11-13 (Transactions / Narratives)';   /* shown in the panel title */
   var BASE = location.origin + '/ECM/Case/Statistics.aspx?caseid=';
   var REQ_BASE = location.origin + '/ECM/Case/Requirements.aspx?caseid=';
   /* Focal Entity info tab; the second address is tried if the first does not answer. */
@@ -30,9 +32,14 @@
   var POLL_MS = 200;       /* how often a loading page is checked */
   var PAGE_TIMEOUT_MS = 60000;
   var PARALLEL = 2;        /* default alerts worked on at the same time; the panel's picker overrides it */
+  var PAR_CHOICES = [1, 2, 3, 5, 10];   /* the picker's choices */
+  /* Export transactions loads each alert's Statistics page in a frame, so it keeps to this many
+     at a time whatever is picked; Get narratives mostly reads one page per alert as plain HTML. */
+  var TRX_PARALLEL_MAX = 3;
   try { PARALLEL = +localStorage.getItem('__ecmParallel') || PARALLEL; } catch (e) { /* storage blocked */ }
   var stopped = false;
   var running = false;
+  var lastRun = '';        /* 'transactions' or 'narratives': what results holds */
 
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
@@ -556,8 +563,7 @@
   function narrativeSheet() {
     var rows = results.map(function (r, i) {
       var parts = r.narrative ? splitCells(r.narrative) : [''];
-      var res = r.narrError ? 'error: ' + r.narrError : !r.narrative ? 'no narrative found' :
-        parts.length > 1 ? 'OK, split into ' + parts.length + ' cells' : 'OK';
+      var res = r.result === 'OK' && parts.length > 1 ? 'OK, split into ' + parts.length + ' cells' : r.result;
       var ecm = /^\d{1,15}$/.test(r.ecm) ? +r.ecm : r.ecm;
       return { vals: [i + 1, ecm, r.velocity, r.customer, r.decision], parts: parts, result: res };
     });
@@ -674,7 +680,8 @@
   }
 
   function copyForExcel() {
-    if (!results.length) { log('Nothing to copy yet - press Start first.'); return; }
+    if (lastRun === 'narratives') { log('The narratives are in the ECM_Narratives xlsx in Downloads. Copy for Excel is for the transactions table.'); return; }
+    if (!results.length) { log('Nothing to copy yet - press Export transactions first.'); return; }
     var tsv = [COLUMNS].concat(tableRows()).map(function (cells) {
       return cells.map(function (c) { return String(c == null ? '' : c).replace(/[\t\r\n]+/g, ' '); }).join('\t');
     }).join('\r\n');
@@ -714,8 +721,8 @@
       '<select class="__ecmPar" style="appearance:auto;-webkit-appearance:menulist;box-sizing:border-box;margin:0;' +
         'width:56px;height:26px;padding:0 4px;border:1px solid #4b5563;border-radius:5px;background:#f9fafb;color:#111827;' +
         'font:12px Segoe UI,Arial,sans-serif;line-height:normal;text-transform:none;cursor:pointer">' +
-        '<option value="1">1</option><option value="2">2</option><option value="3">3</option></select>' +
-      '<span style="color:#9ca3af">more = faster, more load on ECM</span>' +
+        PAR_CHOICES.map(function (n) { return '<option value="' + n + '">' + n + '</option>'; }).join('') + '</select>' +
+      '<span style="color:#9ca3af">more = faster, more load on ECM (transactions: 3 at most)</span>' +
     '</div>' +
     '<div class="__ecmRow" style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:8px 0"></div>' +
     '<div class="__ecmLog" style="max-height:180px;overflow:auto;padding:6px 8px;border-radius:6px;background:#111827;color:#e5e7eb;' +
@@ -725,7 +732,8 @@
   var logEl = panel.querySelector('.__ecmLog');
   var countEl = panel.querySelector('.__ecmCount');
   var parEl = panel.querySelector('.__ecmPar');
-  parEl.value = String(Math.min(3, Math.max(1, PARALLEL)));
+  if (PAR_CHOICES.indexOf(PARALLEL) < 0) PARALLEL = 2;
+  parEl.value = String(PARALLEL);
   parEl.onchange = function () {
     PARALLEL = +parEl.value;
     try { localStorage.setItem('__ecmParallel', String(PARALLEL)); } catch (e) { /* storage blocked */ }
@@ -764,19 +772,16 @@
 
   /* One alert: details and export pages side by side. Returns a results row. */
   async function workAlert(id, line, tagStart) {
-    var tag = tagStart, info = {}, focal = {}, narr = {}, result, t0 = Date.now(), tInfo = 0, tExp = 0, tNarr = 0;
+    var tag = tagStart, info = {}, focal = {}, result, t0 = Date.now(), tInfo = 0, tExp = 0;
     try {
       var both = await Promise.all([
         readInfo(id).then(function (v) { tInfo = Date.now() - t0; return v; }),
         getExport(id).then(function (v) { tExp = Date.now() - t0; return v; }),
-        readFocal(id).catch(function (e) { if (e.message === 'LOGIN') throw e; return { error: e.message }; }),
-        readNarrative(id).then(function (v) { tNarr = Date.now() - t0; return v; },
-          function (e) { if (e.message === 'LOGIN') throw e; return { error: e.message }; })
+        readFocal(id).catch(function (e) { if (e.message === 'LOGIN') throw e; return { error: e.message }; })
       ]);
       info = both[0];
       var ex = both[1];
       focal = both[2] || {};
-      narr = both[3] || {};
       if (info.error) tag += ' (details: ' + info.error + ')';
       else tag += ' ' + (info.velocity || '(no Velocity ID found)');
       if (ex.blob) {
@@ -793,24 +798,50 @@
       delete reqPages[id];
     }
     line.textContent = tag + ' ' + result + '  (' + secs(Date.now() - t0) +
-      (tInfo && tExp ? ': details ' + secs(tInfo) + (info.how ? ' (' + info.how + ')' : '') + ', export ' + secs(tExp) : '') +
-      (narr.error ? ', narrative: ' + narr.error : tNarr ? ', narrative ' + secs(tNarr) + (narr.how ? ' (' + narr.how + ')' : '') +
-        (narr.narrative ? '' : ' - empty') : '') + ')';
+      (tInfo && tExp ? ': details ' + secs(tInfo) + (info.how ? ' (' + info.how + ')' : '') + ', export ' + secs(tExp) : '') + ')';
     return {
       ecm: id, velocity: info.velocity || '', customer: info.customer || '', internalId: info.internalId || '',
       address: info.address, permanent: info.permanent,
       programId: focal.programId || '', programName: focal.programName || '', programDescription: focal.programDescription || '',
-      decision: narr.decision || '', narrative: narr.narrative || '', narrError: narr.error || '',
       file: result.indexOf('OK ') === 0 && result.indexOf('OK (') !== 0 ? result.slice(3) : '', result: result
     };
   }
 
-  async function run() {
+  /* One alert's narrative: the details (for Velocity Alert ID and Customer Name) and the
+     Alert Analyst Decision and Alert Narrative, all from the Requirements page. No export. */
+  async function workNarrative(id, line, tagStart) {
+    var tag = tagStart, info = {}, narr = {}, t0 = Date.now();
+    try {
+      var both = await Promise.all([
+        readInfo(id),
+        readNarrative(id).catch(function (e) { if (e.message === 'LOGIN') throw e; return { error: e.message }; })
+      ]);
+      info = both[0] || {};
+      narr = both[1] || {};
+    } catch (e) {
+      if (e.message === 'LOGIN') throw e;
+      narr = { error: e.message };
+    } finally {
+      delete reqPages[id];
+    }
+    tag += ' ' + (info.velocity || (info.error ? '(details: ' + info.error + ')' : '(no Velocity ID found)'));
+    var result = narr.error ? 'error: ' + narr.error : narr.narrative ? 'OK' : 'no narrative found';
+    line.textContent = tag + ' narrative ' + result + '  (' + secs(Date.now() - t0) + (narr.how ? ', ' + narr.how : '') + ')';
+    return {
+      ecm: id, velocity: info.velocity || '', customer: info.customer || '',
+      decision: narr.decision || '', narrative: narr.narrative || '', result: result
+    };
+  }
+
+  /* what: 'transactions' (export files and ECM_Alert_Info csv) or 'narratives' (ECM_Narratives xlsx). */
+  async function run(what) {
     if (running) return;
     var ids = parseIds(box.value);
     if (!ids.length) { log('Enter at least one alert ID.'); return; }
     running = true; stopped = false;
+    lastRun = what;
     logEl.textContent = '';
+    var work = what === 'narratives' ? workNarrative : workAlert;
     var rows = new Array(ids.length), next = 0, loggedOut = false, t0 = Date.now();
 
     /* PARALLEL workers each take the next alert until none are left. */
@@ -820,7 +851,7 @@
         var tag = '[' + (i + 1) + '/' + ids.length + '] ' + ids[i];
         var line = log(tag + ' working ...');
         try {
-          rows[i] = await workAlert(ids[i], line, tag);
+          rows[i] = await work(ids[i], line, tag);
         } catch (e) {
           loggedOut = true;
           line.textContent = tag + ' session expired';
@@ -830,27 +861,33 @@
       }
     }
     var workers = [];
-    for (var w = 0; w < Math.max(1, PARALLEL); w++) workers.push(worker());
+    var par = what === 'narratives' ? PARALLEL : Math.min(PARALLEL, TRX_PARALLEL_MAX);
+    if (par < PARALLEL) log('Export transactions works on ' + par + ' alerts at a time at most.');
+    for (var w = 0; w < Math.max(1, par); w++) workers.push(worker());
     await Promise.all(workers);
 
     results = rows.filter(Boolean);
     var ok = results.filter(function (r) { return r.result.indexOf('OK') === 0; }).length;
     var failed = results.filter(function (r) { return r.result.indexOf('OK') !== 0; }).map(function (r) { return r.ecm; });
-    if (loggedOut) log('Log in to ECM again, then press Start.');
-    log((stopped || loggedOut ? 'Stopped. ' : 'Finished. ') + ok + ' exported' +
-        (failed.length ? ', failed: ' + failed.join(', ') : '.') + '  Total ' + secs(Date.now() - t0) + '.');
+    if (loggedOut) log('Log in to ECM again, then press the button again.');
+    log((stopped || loggedOut ? 'Stopped. ' : 'Finished. ') + ok + (what === 'narratives' ? ' narrative(s) read' : ' exported') +
+        (failed.length ? ', not done: ' + failed.join(', ') : '.') + '  Total ' + secs(Date.now() - t0) + '.');
     var stamp = stampNow();
-    saveCsv(stamp);
-    if (results.length) log('Saved ECM_Alert_Info CSV to Downloads. "Copy for Excel" copies the same table.');
-    try {
-      if (saveNarratives(stamp)) log('Saved ECM_Narratives_' + stamp + '.xlsx to Downloads.');
-    } catch (e) {
-      log('Could not save the narratives file: ' + e.message);
+    if (what === 'narratives') {
+      try {
+        if (saveNarratives(stamp)) log('Saved ECM_Narratives_' + stamp + '.xlsx to Downloads.');
+      } catch (e) {
+        log('Could not save the narratives file: ' + e.message);
+      }
+    } else {
+      saveCsv(stamp);
+      if (results.length) log('Saved ECM_Alert_Info CSV to Downloads. "Copy for Excel" copies the same table.');
     }
     running = false;
   }
 
-  btn('Start', run, true);
+  btn('Export transactions', function () { run('transactions'); }, true);
+  btn('Get narratives', function () { run('narratives'); }, true);
   btn('Stop', function () { stopped = true; });
   btn('Load my queue', function () {
     var ids = queueIds();
@@ -865,7 +902,7 @@
     updateCount();
     box.focus();
   });
-  btn('Copy for Excel', copyForExcel, false, true);
+  btn('Copy for Excel', copyForExcel);
   panel.querySelector('.__ecmClose').onclick = function (e) { e.preventDefault(); stopped = true; panel.remove(); };
 
   document.body.appendChild(panel);

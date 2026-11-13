@@ -40,38 +40,45 @@ as a separate site. Add a Note such as "SSO login here" instead of recording it.
 
 ## 3. ecm-export.js - export transactions for many alerts
 
-Built from the recording. For each alert (ECM) ID it:
+Built from the recording. It has two buttons.
+
+**Export transactions** - for each alert (ECM) ID it:
 
 1. Opens the alert's **Requirements** page and reads Customer Name, Customer Internal ID,
    Velocity Alert ID, the address (Street Address, City, State, Zip Code, Country) and the
    permanent address.
 2. Opens the **Statistics** page, runs **Export Transactions**, and saves the file to Downloads
    as `<ECM ID>_<Velocity Alert ID>_<file name>`.
-3. Reads the **Alert Analyst Decision** and the **Alert Narrative** (Alert Disposition tab of the
-   Requirements page): from the page as the server sends it, or, when the narrative isn't in it,
-   from the page loaded in a hidden frame with the Alert Disposition tab opened.
 
 At the end it saves `ECM_Alert_Info_<date>_<time>.csv` to Downloads with one row per alert:
 ECM ID, Velocity Alert ID, Customer Name, Customer Internal ID, Address (combined), Street, City,
 State, Zip Code, Country, Permanent Address (combined), Transaction File, Result.
 **Copy for Excel** copies the same table, ready to paste into a sheet.
 
-It also saves `ECM_Narratives_<date>_<time>.xlsx`, one row per alert in the order the IDs were
-given: #, ECM ID, Velocity Alert ID, Customer Name, Alert Analyst Decision, Narrative, Result. The
-header row is frozen and filtered; the narrative keeps its line breaks, wrapped in a wide column.
-A narrative longer than Excel's 32,767-character cell limit continues in "Narrative (continued)"
-columns, split at the last space before the limit; those columns appear only when needed.
-Result says OK, "OK, split into N cells", "no narrative found" or the error.
+**Get narratives** - for each alert it reads the Velocity Alert ID, Customer Name, **Alert Analyst
+Decision** and **Alert Narrative** (Alert Disposition tab of the Requirements page), with no
+export: from the page as the server sends it, or, when the narrative isn't in it, from the page
+loaded in a hidden frame with the Alert Disposition tab opened.
+
+At the end it saves `ECM_Narratives_<date>_<time>.xlsx`, one row per alert in the order the IDs
+were given: #, ECM ID, Velocity Alert ID, Customer Name, Alert Analyst Decision, Narrative, Result.
+The header row is frozen and filtered; the narrative keeps its line breaks, wrapped in a wide
+column. A narrative longer than Excel's 32,767-character cell limit continues in "Narrative
+(continued)" columns, split at the last space before the limit; those columns appear only when
+needed. Result says OK, "OK, split into N cells", "no narrative found" or the error.
 
 `ecm-narrative-probe.js` (and its bookmarklet) lists where a page keeps the narrative, by field
-names and lengths only. It was used to build step 3.
+names and lengths only. It was used to build Get narratives.
 
 1. Log in to ECM in Edge and open the Dashboard.
 2. Start it: Ctrl+Shift+J, paste `ecm-export.js`, Enter. Or add `ecm-export-bookmarklet.txt`
    as a favorite named `Export` and click it.
 3. The box is pre-filled with the alert IDs from My Case Queue. Edit the list, or paste your
    own IDs (one per line, or separated by commas).
-4. Press **Start**. Each alert shows OK or the reason it failed.
+4. Press **Export transactions** or **Get narratives**. Each alert shows OK or the reason it failed.
+   **Alerts at a time** sets how many are worked on together (1, 2, 3, 5 or 10). Get narratives
+   uses the number picked; Export transactions uses 3 at most, since each export loads a full page.
+   More is faster but puts more load on ECM.
 
 Each alert's Statistics page is loaded in a hidden frame (not a pop-up, so nothing is
 blocked). The export is requested from that page so the file can be named with the alert ID.
