@@ -47,11 +47,24 @@ Built from the recording. For each alert (ECM) ID it:
    permanent address.
 2. Opens the **Statistics** page, runs **Export Transactions**, and saves the file to Downloads
    as `<ECM ID>_<Velocity Alert ID>_<file name>`.
+3. Reads the **Alert Analyst Decision** and the **Alert Narrative** (Alert Disposition tab of the
+   Requirements page): from the page as the server sends it, or, when the narrative isn't in it,
+   from the page loaded in a hidden frame with the Alert Disposition tab opened.
 
 At the end it saves `ECM_Alert_Info_<date>_<time>.csv` to Downloads with one row per alert:
 ECM ID, Velocity Alert ID, Customer Name, Customer Internal ID, Address (combined), Street, City,
 State, Zip Code, Country, Permanent Address (combined), Transaction File, Result.
 **Copy for Excel** copies the same table, ready to paste into a sheet.
+
+It also saves `ECM_Narratives_<date>_<time>.xlsx`, one row per alert in the order the IDs were
+given: #, ECM ID, Velocity Alert ID, Customer Name, Alert Analyst Decision, Narrative, Result. The
+header row is frozen and filtered; the narrative keeps its line breaks, wrapped in a wide column.
+A narrative longer than Excel's 32,767-character cell limit continues in "Narrative (continued)"
+columns, split at the last space before the limit; those columns appear only when needed.
+Result says OK, "OK, split into N cells", "no narrative found" or the error.
+
+`ecm-narrative-probe.js` (and its bookmarklet) lists where a page keeps the narrative, by field
+names and lengths only. It was used to build step 3.
 
 1. Log in to ECM in Edge and open the Dashboard.
 2. Start it: Ctrl+Shift+J, paste `ecm-export.js`, Enter. Or add `ecm-export-bookmarklet.txt`

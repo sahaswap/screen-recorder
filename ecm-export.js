@@ -4,14 +4,16 @@
     1. reads Customer Name, Customer Internal ID, current and permanent address, and Velocity Alert ID from the Requirements page;
     2. runs "Export Transactions" on the Statistics page, saving the file to Downloads as
        <ECM ID>_<Velocity Alert ID>_<original file name>;
-  then saves ECM_Alert_Info_<date>.csv (one row per alert) for the Excel tool.
+    3. reads the Alert Analyst Decision and the Alert Narrative from the Requirements page;
+  then saves ECM_Alert_Info_<date>.csv (one row per alert) for the Excel tool, and
+  ECM_Narratives_<date>.xlsx (one row per alert, the narrative in full).
   Run on any ECM page while logged in: paste into the Console (Ctrl+Shift+J) or use the bookmarklet.
   Uses your existing Edge session - no passwords are stored or sent anywhere else.
 */
 (function () {
   if (document.getElementById('__ecmExport')) return;
 
-  var VERSION = '2026-10-15 (with Program)';   /* shown in the panel title */
+  var VERSION = '2026-11-13 (with Narratives)';   /* shown in the panel title */
   var BASE = location.origin + '/ECM/Case/Statistics.aspx?caseid=';
   var REQ_BASE = location.origin + '/ECM/Case/Requirements.aspx?caseid=';
   /* Focal Entity info tab; the second address is tried if the first does not answer. */
@@ -221,14 +223,27 @@
     for (var waited = 0; d.readyState !== 'complete' && waited < PAGE_TIMEOUT_MS; waited += POLL_MS) await sleep(POLL_MS);
   }
 
+  /* The Requirements page as the server sends it, fetched once per alert: the details and the
+     narrative are both read from it. workAlert drops it when the alert is done. */
+  var reqPages = {};
+  function reqPage(id) {
+    if (!reqPages[id]) {
+      reqPages[id] = fetch(REQ_BASE + id, { credentials: 'same-origin' }).then(function (res) {
+        if (isLogin(res.url)) throw new Error('LOGIN');
+        return res.ok ? res.text() : null;
+      }).then(function (html) {
+        return html == null ? null : new DOMParser().parseFromString(html, 'text/html');
+      });
+    }
+    return reqPages[id];
+  }
+
   /* Fast path: fetch the Requirements page as plain HTML (no scripts, styles or frames)
      and read the fields by ECM's own element ids. Returns null when something needed is
      not in the raw HTML - the caller then falls back to the full-page readInfoFrame. */
   async function readInfoFast(id) {
-    var res = await fetch(REQ_BASE + id, { credentials: 'same-origin' });
-    if (isLogin(res.url)) throw new Error('LOGIN');
-    if (!res.ok) return null;
-    var d = new DOMParser().parseFromString(await res.text(), 'text/html');
+    var d = await reqPage(id);
+    if (!d) return null;
 
     /* Header lines written as "Label: value" (Customer Name, Customer Internal ID). */
     function header(label) {
@@ -354,6 +369,85 @@
     });
   }
 
+  /* ---- Alert Analyst Decision and Alert Narrative (Requirements page, Alert Disposition tab) */
+  var BOX = 'textarea, select, input:not([type=hidden]):not([type=button]):not([type=submit])' +
+    ':not([type=checkbox]):not([type=radio])';
+
+  /* The boxes holding a Requirements field's value, found by its label. On the Alert Disposition
+     tab the box is not inside "..._divSoureField_N" but beside it, with an id that starts like the
+     label's and ends in the same _N: "..._ReqLabel_2" -> "..._txtMulti<number>_2" (text) or
+     "..._ddl<number>_0" (dropdown). Failing that, the nearest box around the label. Help-text
+     copies of the labels ("..._FaqLabel_N") don't count. */
+  function reqBoxes(d, label) {
+    var rx = new RegExp('^\\s*\\*?\\s*' + label + '\\s*:?\\s*\\*?\\s*$', 'i'), found = [];
+    var boxes = d.querySelectorAll(BOX);
+    Array.prototype.forEach.call(d.querySelectorAll('[id*="ReqLabel_"]'), function (lab) {
+      var m = /^(.*)ReqLabel_(\d+)$/.exec(lab.id);
+      if (!m || !rx.test(lab.textContent)) return;
+      var box = null, end = '_' + m[2];
+      Array.prototype.some.call(boxes, function (el) {
+        var i = el.id || '';
+        if (i.indexOf(m[1]) === 0 && i.slice(-end.length) === end) { box = el; return true; }
+        return false;
+      });
+      for (var a = lab.parentElement, k = 0; !box && a && k < 4; a = a.parentElement, k++) box = a.querySelector(BOX);
+      if (box) found.push(box);
+    });
+    return found;
+  }
+
+  /* A box's value: the chosen option of a dropdown, or the text with its line breaks kept.
+     live: a page in a frame (read what is showing) rather than the HTML as sent. */
+  function boxValue(box, live) {
+    if (box.tagName === 'SELECT') {
+      var o = live ? box.options[box.selectedIndex] : box.querySelector('option[selected]');
+      return o && o.value !== '' && !/^\s*(--|select\b)/i.test(o.textContent) ? clean(o.textContent) : '';
+    }
+    var t = live ? box.value : box.tagName === 'TEXTAREA' ? box.textContent : box.getAttribute('value');
+    return (t || '').replace(/\r\n?/g, '\n').replace(/[ \t]+$/gm, '').trim();
+  }
+
+  /* Both fields from one page; null when neither label is on it (that tab isn't loaded). */
+  function narrativeFrom(d, live) {
+    var pick = function (boxes) {   /* the first box that says something */
+      for (var i = 0; i < boxes.length; i++) { var v = boxValue(boxes[i], live); if (v) return v; }
+      return '';
+    };
+    var nb = reqBoxes(d, 'Alert Narrative'), db = reqBoxes(d, 'Alert Analyst Decision');
+    return nb.length || db.length ? { narrative: pick(nb), decision: pick(db) } : null;
+  }
+
+  /* From the Requirements page as sent (fast); when the narrative isn't there, from the page in a
+     frame with its Alert Disposition tab opened. */
+  async function readNarrative(id) {
+    var d = await reqPage(id);
+    var n = d ? narrativeFrom(d, false) : null;
+    if (n && n.narrative) { n.how = 'fast'; return n; }
+    var full = await readNarrativeFrame(id);
+    if (full && !full.error) { full.how = 'full page'; return full; }
+    if (n) { n.how = 'fast'; return n; }   /* the fields are there, the narrative is empty */
+    return full;
+  }
+
+  function readNarrativeFrame(id) {
+    var clicked = false;
+    return withFrame(REQ_BASE + id, function (d) {
+      if (!d.body) return null;
+      if (reqBoxes(d, 'Alert Narrative').length) return true;
+      if (!clicked && d.readyState === 'complete') {
+        var tabs = Array.prototype.filter.call(d.querySelectorAll('a'), function (a) {
+          return clean(a.textContent) === 'Alert Disposition';
+        });
+        var tab = tabs.filter(function (a) { return /requirement-font-size/.test(a.className); })[0] || tabs[0];
+        if (tab) { clicked = true; tab.click(); }
+      }
+      return null;
+    }, function (d, why) {
+      if (!d) return { error: why === 'page did not finish loading' ? 'Alert Narrative not found on the page' : why };
+      return narrativeFrom(d, true) || { error: 'Alert Narrative not found on the page' };
+    });
+  }
+
   /* Post the live page's form ourselves so the file can be named and confirmed.
      Returns { blob, disp, type } or null when the server sent no file. */
   async function postExport(d, btn) {
@@ -402,13 +496,181 @@
     });
   }
 
-  function saveCsv() {
+  /* yyyymmdd_hhmm, for the file names */
+  function stampNow() {
+    var now = new Date();
+    return now.getFullYear() + ('0' + (now.getMonth() + 1)).slice(-2) + ('0' + now.getDate()).slice(-2) + '_' +
+      ('0' + now.getHours()).slice(-2) + ('0' + now.getMinutes()).slice(-2);
+  }
+
+  function saveCsv(stamp) {
     if (!results.length) return;
     var lines = [COLUMNS].concat(tableRows()).map(function (cells) { return cells.map(csvCell).join(','); });
-    var now = new Date();
-    var stamp = now.getFullYear() + ('0' + (now.getMonth() + 1)).slice(-2) + ('0' + now.getDate()).slice(-2) + '_' +
-      ('0' + now.getHours()).slice(-2) + ('0' + now.getMinutes()).slice(-2);
     saveBlob(new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv' }), 'ECM_Alert_Info_' + stamp + '.csv');
+  }
+
+  /* ---- ECM_Narratives_<date>_<time>.xlsx: one row per alert, in the order the IDs were given.
+     An .xlsx is a zip of XML files; this writes the few Excel needs, stored without compression. */
+  var CELL_MAX = 32767;   /* the most characters Excel holds in one cell */
+
+  /* A narrative as cells of at most CELL_MAX characters. Only a longer one is split, at the last
+     space or line break before the limit, so no word is cut; the next cell starts at the next word. */
+  function splitCells(text) {
+    var parts = [];
+    while (text.length > CELL_MAX) {
+      var head = text.slice(0, CELL_MAX + 1);
+      var cut = Math.max(head.lastIndexOf(' '), head.lastIndexOf('\n'), head.lastIndexOf('\t'));
+      if (cut < CELL_MAX / 2) {   /* no break anywhere near the limit: cut at it */
+        cut = CELL_MAX;
+        var c = text.charCodeAt(cut - 1);
+        if (c >= 0xD800 && c <= 0xDBFF) cut--;   /* not between the two halves of one character */
+      }
+      parts.push(text.slice(0, cut).replace(/\s+$/, ''));
+      text = text.slice(cut).replace(/^\s+/, '');
+    }
+    parts.push(text);
+    return parts;
+  }
+
+  function xmlText(s) {
+    return String(s == null ? '' : s).replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\ufffe\uffff]/g, '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  /* 0 -> A, 25 -> Z, 26 -> AA */
+  function colName(i) {
+    var s = '';
+    for (i++; i > 0; i = Math.floor((i - 1) / 26)) s = String.fromCharCode(65 + (i - 1) % 26) + s;
+    return s;
+  }
+
+  /* Text is written into the cell itself, so a value starting with "=" stays text. */
+  function cellXml(ref, v, style) {
+    if (typeof v === 'number') return '<c r="' + ref + '" s="' + style + '"><v>' + v + '</v></c>';
+    return '<c r="' + ref + '" s="' + style + '" t="inlineStr"><is><t xml:space="preserve">' + xmlText(v) + '</t></is></c>';
+  }
+
+  /* The sheet: header row frozen and filtered; Narrative columns wide, wrapped and top-aligned.
+     "Narrative (continued)" columns are added only when a narrative in this run needs them.
+     Styles: 1 header, 2 wrapped text, 3 other cells. */
+  function narrativeSheet() {
+    var rows = results.map(function (r, i) {
+      var parts = r.narrative ? splitCells(r.narrative) : [''];
+      var res = r.narrError ? 'error: ' + r.narrError : !r.narrative ? 'no narrative found' :
+        parts.length > 1 ? 'OK, split into ' + parts.length + ' cells' : 'OK';
+      var ecm = /^\d{1,15}$/.test(r.ecm) ? +r.ecm : r.ecm;
+      return { vals: [i + 1, ecm, r.velocity, r.customer, r.decision], parts: parts, result: res };
+    });
+    var nCont = Math.max.apply(null, rows.map(function (r) { return r.parts.length; })) - 1;
+    var head = ['#', 'ECM ID', 'Velocity Alert ID', 'Customer Name', 'Alert Analyst Decision', 'Narrative'];
+    var widths = [5, 10, 18, 28, 24, 100];
+    for (var k = 1; k <= nCont; k++) {
+      head.push(nCont > 1 ? 'Narrative (continued ' + k + ')' : 'Narrative (continued)');
+      widths.push(100);
+    }
+    head.push('Result');
+    widths.push(26);
+    var ref = 'A1:' + colName(head.length - 1) + (rows.length + 1);
+    var x = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+      '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">',
+      '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>',
+      '</sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/><cols>'];
+    widths.forEach(function (w, i) { x.push('<col min="' + (i + 1) + '" max="' + (i + 1) + '" width="' + w + '" customWidth="1"/>'); });
+    x.push('</cols><sheetData><row r="1">');
+    head.forEach(function (h, i) { x.push(cellXml(colName(i) + '1', h, 1)); });
+    x.push('</row>');
+    rows.forEach(function (r, j) {
+      var n = j + 2, vals = r.vals.concat(r.parts);
+      while (vals.length < 6 + nCont) vals.push('');
+      vals.push(r.result);
+      x.push('<row r="' + n + '">');
+      vals.forEach(function (v, i) {
+        if (v !== '' && v != null) x.push(cellXml(colName(i) + n, v, i >= 5 && i < 6 + nCont ? 2 : 3));
+      });
+      x.push('</row>');
+    });
+    x.push('</sheetData><autoFilter ref="' + ref + '"/></worksheet>');
+    return { xml: x.join(''), ref: ref };
+  }
+
+  function saveNarratives(stamp) {
+    if (!results.length) return false;
+    var sheet = narrativeSheet();
+    var NS = 'http://schemas.openxmlformats.org/', HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+    var files = [
+      ['[Content_Types].xml', HEAD + '<Types xmlns="' + NS + 'package/2006/content-types">' +
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+        '<Default Extension="xml" ContentType="application/xml"/>' +
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' +
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' +
+        '</Types>'],
+      ['_rels/.rels', HEAD + '<Relationships xmlns="' + NS + 'package/2006/relationships">' +
+        '<Relationship Id="rId1" Type="' + NS + 'officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>' +
+        '</Relationships>'],
+      ['xl/workbook.xml', HEAD + '<workbook xmlns="' + NS + 'spreadsheetml/2006/main" xmlns:r="' + NS +
+        'officeDocument/2006/relationships"><sheets><sheet name="Narratives" sheetId="1" r:id="rId1"/></sheets>' +
+        '<definedNames><definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">Narratives!' +
+        sheet.ref.replace(/([A-Z]+)(\d+)/g, '$$$1$$$2') + '</definedName></definedNames></workbook>'],
+      ['xl/_rels/workbook.xml.rels', HEAD + '<Relationships xmlns="' + NS + 'package/2006/relationships">' +
+        '<Relationship Id="rId1" Type="' + NS + 'officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>' +
+        '<Relationship Id="rId2" Type="' + NS + 'officeDocument/2006/relationships/styles" Target="styles.xml"/>' +
+        '</Relationships>'],
+      ['xl/worksheets/sheet1.xml', sheet.xml],
+      ['xl/styles.xml', HEAD + '<styleSheet xmlns="' + NS + 'spreadsheetml/2006/main">' +
+        '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts>' +
+        '<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>' +
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFD9E1F2"/><bgColor indexed="64"/></patternFill></fill></fills>' +
+        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>' +
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
+        '<cellXfs count="4"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>' +
+        '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment vertical="center"/></xf>' +
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>' +
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top"/></xf></cellXfs>' +
+        '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>']
+    ];
+    saveBlob(zipStored(files), 'ECM_Narratives_' + stamp + '.xlsx');
+    return true;
+  }
+
+  /* A zip with each file stored as it is (no compression). */
+  var CRC_TABLE = null;
+  function crc32(bytes) {
+    if (!CRC_TABLE) {
+      CRC_TABLE = new Uint32Array(256);
+      for (var n = 0; n < 256; n++) {
+        var c = n;
+        for (var k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+        CRC_TABLE[n] = c >>> 0;
+      }
+    }
+    var crc = 0xFFFFFFFF;
+    for (var i = 0; i < bytes.length; i++) crc = CRC_TABLE[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+  }
+
+  function zipStored(files) {
+    var enc = new TextEncoder(), parts = [], central = [], offset = 0, cdSize = 0;
+    files.forEach(function (f) {
+      var name = enc.encode(f[0]), data = enc.encode(f[1]), crc = crc32(data);
+      var h = new DataView(new ArrayBuffer(30));
+      h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(12, 0x21, true);
+      h.setUint32(14, crc, true); h.setUint32(18, data.length, true); h.setUint32(22, data.length, true);
+      h.setUint16(26, name.length, true);
+      parts.push(new Uint8Array(h.buffer), name, data);
+      var c = new DataView(new ArrayBuffer(46));
+      c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(14, 0x21, true);
+      c.setUint32(16, crc, true); c.setUint32(20, data.length, true); c.setUint32(24, data.length, true);
+      c.setUint16(28, name.length, true); c.setUint32(42, offset, true);
+      central.push(new Uint8Array(c.buffer), name);
+      offset += 30 + name.length + data.length;
+      cdSize += 46 + name.length;
+    });
+    var e = new DataView(new ArrayBuffer(22));
+    e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true);
+    e.setUint32(12, cdSize, true); e.setUint32(16, offset, true);
+    return new Blob(parts.concat(central, [new Uint8Array(e.buffer)]),
+      { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
   }
 
   function copyForExcel() {
@@ -502,16 +764,19 @@
 
   /* One alert: details and export pages side by side. Returns a results row. */
   async function workAlert(id, line, tagStart) {
-    var tag = tagStart, info = {}, focal = {}, result, t0 = Date.now(), tInfo = 0, tExp = 0;
+    var tag = tagStart, info = {}, focal = {}, narr = {}, result, t0 = Date.now(), tInfo = 0, tExp = 0, tNarr = 0;
     try {
       var both = await Promise.all([
         readInfo(id).then(function (v) { tInfo = Date.now() - t0; return v; }),
         getExport(id).then(function (v) { tExp = Date.now() - t0; return v; }),
-        readFocal(id).catch(function (e) { if (e.message === 'LOGIN') throw e; return { error: e.message }; })
+        readFocal(id).catch(function (e) { if (e.message === 'LOGIN') throw e; return { error: e.message }; }),
+        readNarrative(id).then(function (v) { tNarr = Date.now() - t0; return v; },
+          function (e) { if (e.message === 'LOGIN') throw e; return { error: e.message }; })
       ]);
       info = both[0];
       var ex = both[1];
       focal = both[2] || {};
+      narr = both[3] || {};
       if (info.error) tag += ' (details: ' + info.error + ')';
       else tag += ' ' + (info.velocity || '(no Velocity ID found)');
       if (ex.blob) {
@@ -524,13 +789,18 @@
     } catch (e) {
       if (e.message === 'LOGIN') throw e;
       result = 'error: ' + e.message;
+    } finally {
+      delete reqPages[id];
     }
     line.textContent = tag + ' ' + result + '  (' + secs(Date.now() - t0) +
-      (tInfo && tExp ? ': details ' + secs(tInfo) + (info.how ? ' (' + info.how + ')' : '') + ', export ' + secs(tExp) : '') + ')';
+      (tInfo && tExp ? ': details ' + secs(tInfo) + (info.how ? ' (' + info.how + ')' : '') + ', export ' + secs(tExp) : '') +
+      (narr.error ? ', narrative: ' + narr.error : tNarr ? ', narrative ' + secs(tNarr) + (narr.how ? ' (' + narr.how + ')' : '') +
+        (narr.narrative ? '' : ' - empty') : '') + ')';
     return {
       ecm: id, velocity: info.velocity || '', customer: info.customer || '', internalId: info.internalId || '',
       address: info.address, permanent: info.permanent,
       programId: focal.programId || '', programName: focal.programName || '', programDescription: focal.programDescription || '',
+      decision: narr.decision || '', narrative: narr.narrative || '', narrError: narr.error || '',
       file: result.indexOf('OK ') === 0 && result.indexOf('OK (') !== 0 ? result.slice(3) : '', result: result
     };
   }
@@ -569,8 +839,14 @@
     if (loggedOut) log('Log in to ECM again, then press Start.');
     log((stopped || loggedOut ? 'Stopped. ' : 'Finished. ') + ok + ' exported' +
         (failed.length ? ', failed: ' + failed.join(', ') : '.') + '  Total ' + secs(Date.now() - t0) + '.');
-    saveCsv();
+    var stamp = stampNow();
+    saveCsv(stamp);
     if (results.length) log('Saved ECM_Alert_Info CSV to Downloads. "Copy for Excel" copies the same table.');
+    try {
+      if (saveNarratives(stamp)) log('Saved ECM_Narratives_' + stamp + '.xlsx to Downloads.');
+    } catch (e) {
+      log('Could not save the narratives file: ' + e.message);
+    }
     running = false;
   }
 
