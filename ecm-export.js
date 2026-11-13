@@ -15,7 +15,7 @@
 (function () {
   if (document.getElementById('__ecmExport')) return;
 
-  var VERSION = '2026-11-13 (Transactions / Narratives)';   /* shown in the panel title */
+  var VERSION = '2026-11-13b (Transactions / Narratives)';   /* shown in the panel title */
   var BASE = location.origin + '/ECM/Case/Statistics.aspx?caseid=';
   var REQ_BASE = location.origin + '/ECM/Case/Requirements.aspx?caseid=';
   /* Focal Entity info tab; the second address is tried if the first does not answer. */
@@ -40,6 +40,10 @@
   var stopped = false;
   var running = false;
   var lastRun = '';        /* 'transactions' or 'narratives': what results holds */
+  var BACKUP_EVERY = 250;  /* Get narratives on a longer list saves a backup file after every this many alerts */
+  /* Get narratives' list until it is finished: each ID's place in it and its row so far. A run
+     that is stopped or loses the session keeps it, so the next run's file has the whole list. */
+  var job = null;
 
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
@@ -503,11 +507,12 @@
     });
   }
 
-  /* yyyymmdd_hhmm, for the file names */
-  function stampNow() {
-    var now = new Date();
-    return now.getFullYear() + ('0' + (now.getMonth() + 1)).slice(-2) + ('0' + now.getDate()).slice(-2) + '_' +
-      ('0' + now.getHours()).slice(-2) + ('0' + now.getMinutes()).slice(-2);
+  /* yyyymmdd_hhmm for the file names, with ss added when seconds is set (the narratives files,
+     so two runs in one minute don't get the same name). */
+  function stampNow(seconds) {
+    var now = new Date(), two = function (n) { return ('0' + n).slice(-2); };
+    return now.getFullYear() + two(now.getMonth() + 1) + two(now.getDate()) + '_' + two(now.getHours()) +
+      two(now.getMinutes()) + (seconds ? two(now.getSeconds()) : '');
   }
 
   function saveCsv(stamp) {
@@ -558,14 +563,14 @@
   }
 
   /* The sheet: header row frozen and filtered; Narrative columns wide, wrapped and top-aligned.
-     "Narrative (continued)" columns are added only when a narrative in this run needs them.
-     Styles: 1 header, 2 wrapped text, 3 other cells. */
-  function narrativeSheet() {
-    var rows = results.map(function (r, i) {
+     "Narrative (continued)" columns are added only when a narrative in the file needs them.
+     # is the alert's place in the list. Styles: 1 header, 2 wrapped text, 3 other cells. */
+  function narrativeSheet(list) {
+    var rows = list.map(function (r) {
       var parts = r.narrative ? splitCells(r.narrative) : [''];
       var res = r.result === 'OK' && parts.length > 1 ? 'OK, split into ' + parts.length + ' cells' : r.result;
       var ecm = /^\d{1,15}$/.test(r.ecm) ? +r.ecm : r.ecm;
-      return { vals: [i + 1, ecm, r.velocity, r.customer, r.decision], parts: parts, result: res };
+      return { vals: [r.n, ecm, r.velocity, r.customer, r.decision], parts: parts, result: res };
     });
     var nCont = Math.max.apply(null, rows.map(function (r) { return r.parts.length; })) - 1;
     var head = ['#', 'ECM ID', 'Velocity Alert ID', 'Customer Name', 'Alert Analyst Decision', 'Narrative'];
@@ -599,9 +604,8 @@
     return { xml: x.join(''), ref: ref };
   }
 
-  function saveNarratives(stamp) {
-    if (!results.length) return false;
-    var sheet = narrativeSheet();
+  function saveNarratives(list, name) {
+    var sheet = narrativeSheet(list);
     var NS = 'http://schemas.openxmlformats.org/', HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
     var files = [
       ['[Content_Types].xml', HEAD + '<Types xmlns="' + NS + 'package/2006/content-types">' +
@@ -635,8 +639,7 @@
         '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top"/></xf></cellXfs>' +
         '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>']
     ];
-    saveBlob(zipStored(files), 'ECM_Narratives_' + stamp + '.xlsx');
-    return true;
+    saveBlob(zipStored(files), name);
   }
 
   /* A zip with each file stored as it is (no compression). */
@@ -725,11 +728,13 @@
       '<span style="color:#9ca3af">more = faster, more load on ECM (transactions: 3 at most)</span>' +
     '</div>' +
     '<div class="__ecmRow" style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:8px 0"></div>' +
+    '<div class="__ecmProg" style="margin:0 0 6px;font-size:12px;color:#d1d5db"></div>' +
     '<div class="__ecmLog" style="max-height:180px;overflow:auto;padding:6px 8px;border-radius:6px;background:#111827;color:#e5e7eb;' +
       'font:12px/1.45 Consolas,monospace;white-space:pre-wrap;min-height:18px"></div>';
   var box = panel.querySelector('textarea');
   var row = panel.querySelector('.__ecmRow');
   var logEl = panel.querySelector('.__ecmLog');
+  var progEl = panel.querySelector('.__ecmProg');
   var countEl = panel.querySelector('.__ecmCount');
   var parEl = panel.querySelector('.__ecmPar');
   if (PAR_CHOICES.indexOf(PARALLEL) < 0) PARALLEL = 2;
@@ -833,16 +838,56 @@
     };
   }
 
-  /* what: 'transactions' (export files and ECM_Alert_Info csv) or 'narratives' (ECM_Narratives xlsx). */
+  function duration(ms) {
+    var s = Math.round(ms / 1000);
+    if (s < 60) return s + ' s';
+    var m = Math.round(s / 60);
+    return m < 60 ? m + ' min' : Math.floor(m / 60) + ' h ' + (m % 60) + ' min';
+  }
+
+  /* While a run is going, closing or reloading the tab asks first: what was read is only saved
+     at the end (and in the backups). */
+  function holdPage(e) { e.preventDefault(); e.returnValue = ''; return ''; }
+
+  /* what: 'transactions' (export files and ECM_Alert_Info csv) or 'narratives' (ECM_Narratives xlsx).
+     Alerts not done, or that failed, are put back in the box afterwards, so pressing the button
+     again does just those. */
   async function run(what) {
     if (running) return;
     var ids = parseIds(box.value);
     if (!ids.length) { log('Enter at least one alert ID.'); return; }
+    var narr = what === 'narratives';
     running = true; stopped = false;
     lastRun = what;
     logEl.textContent = '';
-    var work = what === 'narratives' ? workNarrative : workAlert;
-    var rows = new Array(ids.length), next = 0, loggedOut = false, t0 = Date.now();
+    if (narr) {
+      if (job) log('Carrying on with the last list: the file at the end has its earlier alerts too. Press Clear first to start a new list.');
+      else job = { order: {}, count: 0, rows: {} };
+      ids.forEach(function (id) { if (!(id in job.order)) job.order[id] = ++job.count; });
+    }
+    var work = narr ? workNarrative : workAlert;
+    var rows = new Array(ids.length), next = 0, done = 0, failed = 0, loggedOut = false, t0 = Date.now();
+    var stamp = stampNow(narr), pending = [], backups = 0;
+
+    function needsRedo(r) { return !r || (narr ? /^error/.test(r.result) : r.result.indexOf('OK') !== 0); }
+    function showProgress() {
+      var left = ids.length - done;
+      progEl.textContent = done.toLocaleString() + ' of ' + ids.length.toLocaleString() + ' done' +
+        (failed ? ' (' + failed.toLocaleString() + ' failed)' : '') +
+        (running && done && left && !stopped && !loggedOut ? ' - about ' + duration((Date.now() - t0) / done * left) + ' left' : '');
+    }
+    /* The alerts read since the last backup, as their own file. */
+    function saveBackup() {
+      var name = 'ECM_Narratives_' + stamp + '_backup' + (backups + 1) + '.xlsx';
+      try {
+        saveNarratives(pending.slice().sort(function (a, b) { return a.n - b.n; }), name);
+        backups++;
+        pending = [];
+        log('Backup saved: ' + name);
+      } catch (e) {
+        log('Could not save a backup (' + e.message + '); will try again.');
+      }
+    }
 
     /* PARALLEL workers each take the next alert until none are left. */
     async function worker() {
@@ -857,33 +902,62 @@
           line.textContent = tag + ' session expired';
           return;
         }
+        done++;
+        if (needsRedo(rows[i])) failed++;
+        if (narr) {
+          rows[i].n = job.order[ids[i]];
+          job.rows[ids[i]] = rows[i];
+          pending.push(rows[i]);
+          if (ids.length > BACKUP_EVERY && pending.length >= BACKUP_EVERY) saveBackup();
+        }
+        showProgress();
         await sleep(PAUSE_MS);
       }
     }
+    window.addEventListener('beforeunload', holdPage);
+    showProgress();
     var workers = [];
-    var par = what === 'narratives' ? PARALLEL : Math.min(PARALLEL, TRX_PARALLEL_MAX);
+    var par = narr ? PARALLEL : Math.min(PARALLEL, TRX_PARALLEL_MAX);
     if (par < PARALLEL) log('Export transactions works on ' + par + ' alerts at a time at most.');
     for (var w = 0; w < Math.max(1, par); w++) workers.push(worker());
     await Promise.all(workers);
+    window.removeEventListener('beforeunload', holdPage);
 
     results = rows.filter(Boolean);
-    var ok = results.filter(function (r) { return r.result.indexOf('OK') === 0; }).length;
-    var failed = results.filter(function (r) { return r.result.indexOf('OK') !== 0; }).map(function (r) { return r.ecm; });
-    if (loggedOut) log('Log in to ECM again, then press the button again.');
-    log((stopped || loggedOut ? 'Stopped. ' : 'Finished. ') + ok + (what === 'narratives' ? ' narrative(s) read' : ' exported') +
-        (failed.length ? ', not done: ' + failed.join(', ') : '.') + '  Total ' + secs(Date.now() - t0) + '.');
-    var stamp = stampNow();
-    if (what === 'narratives') {
+    var left = ids.filter(function (id, i) { return needsRedo(rows[i]); });
+    var head = (stopped || loggedOut ? 'Stopped. ' : 'Finished. ');
+    var tail = (left.length ? ', ' + left.length + ' not done' : '') + '. Total ' + duration(Date.now() - t0) + '.';
+    if (narr) {
+      var count = function (res) { return results.filter(function (r) { return r.result === res; }).length; };
+      log(head + count('OK') + ' narrative(s) read, ' + count('no narrative found') + ' with no narrative' + tail);
+      /* One file with the whole list: this run's alerts and any read by earlier runs of it. */
+      var all = Object.keys(job.rows).map(function (id) { return job.rows[id]; }).sort(function (a, b) { return a.n - b.n; });
+      var name = 'ECM_Narratives_' + stamp + '.xlsx';
       try {
-        if (saveNarratives(stamp)) log('Saved ECM_Narratives_' + stamp + '.xlsx to Downloads.');
+        if (all.length) {
+          saveNarratives(all, name);
+          log('Saved ' + name + ' with ' + all.length + ' alert(s)' +
+            (all.length > results.length ? ', earlier runs of this list included' : '') + '.' +
+            (backups ? ' The _backup files are no longer needed.' : ''));
+        }
       } catch (e) {
-        log('Could not save the narratives file: ' + e.message);
+        log('Could not save ' + name + ': ' + e.message + (backups ? ' The _backup files hold what was read.' : ''));
       }
+      if (!left.length) job = null;
     } else {
+      log(head + results.filter(function (r) { return r.result.indexOf('OK') === 0; }).length + ' exported' + tail);
       saveCsv(stamp);
       if (results.length) log('Saved ECM_Alert_Info CSV to Downloads. "Copy for Excel" copies the same table.');
     }
+    if (left.length) {
+      box.value = left.join('\n');
+      updateCount();
+      log('The ' + left.length + ' alert(s) not done are now in the box. ' +
+        (loggedOut ? 'Log in to ECM again in a new tab (keep this one open), then press ' : 'Press ') +
+        (narr ? 'Get narratives to do them; the file will then have the whole list.' : 'Export transactions to do them.'));
+    }
     running = false;
+    showProgress();
   }
 
   btn('Export transactions', function () { run('transactions'); }, true);
@@ -899,6 +973,8 @@
     if (running) { log('Export is running - press Stop first.'); return; }
     box.value = '';
     logEl.textContent = '';
+    progEl.textContent = '';
+    if (job) { job = null; log('Cleared. The next Get narratives starts a new list.'); }
     updateCount();
     box.focus();
   });

@@ -80,6 +80,18 @@ names and lengths only. It was used to build Get narratives.
    uses the number picked; Export transactions uses 3 at most, since each export loads a full page.
    More is faster but puts more load on ECM.
 
+The line above the log shows progress: how many are done, how many failed and about how long is
+left. While a run is going, Edge asks before the tab is closed or reloaded.
+
+When a run stops (Stop, or the ECM session expires), the alerts not done or failed are put back in
+the box: log in again in a new tab if needed, keep this tab open, and press the same button again.
+
+**Long lists of narratives:** with more than 250 IDs, Get narratives also saves
+`ECM_Narratives_<date>_<time>_backup<N>.xlsx` after every 250 alerts, so a closed tab loses at most
+250. At the end it saves one `ECM_Narratives_<date>_<time>.xlsx` with the whole list, including
+alerts read by an earlier run of the same list that was stopped. The backup files can then be
+deleted. Press **Clear** to start a new list.
+
 Each alert's Statistics page is loaded in a hidden frame (not a pop-up, so nothing is
 blocked). The export is requested from that page so the file can be named with the alert ID.
 If that gets no file, the tool clicks the real Export button instead, and that file keeps
