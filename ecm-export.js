@@ -9,13 +9,14 @@
   "Get narratives", for each alert, reads the Velocity Alert ID, Customer Name, Alert Analyst
   Decision and Alert Narrative from the Requirements page, with no export, then saves
   ECM_Narratives_<date>.xlsx (one row per alert, the narrative in full).
+  "Merge narrative files" joins ECM_Narratives files (backups and finished ones) into one.
   Run on any ECM page while logged in: paste into the Console (Ctrl+Shift+J) or use the bookmarklet.
   Uses your existing Edge session - no passwords are stored or sent anywhere else.
 */
 (function () {
   if (document.getElementById('__ecmExport')) return;
 
-  var VERSION = '2026-11-13b (Transactions / Narratives)';   /* shown in the panel title */
+  var VERSION = '2026-11-16 (Transactions / Narratives / Merge)';   /* shown in the panel title */
   var BASE = location.origin + '/ECM/Case/Statistics.aspx?caseid=';
   var REQ_BASE = location.origin + '/ECM/Case/Requirements.aspx?caseid=';
   /* Focal Entity info tab; the second address is tried if the first does not answer. */
@@ -642,6 +643,152 @@
     saveBlob(zipStored(files), name);
   }
 
+  /* ---- Merge narrative files: ECM_Narratives files (backups, finished ones, from any runs) into
+     one, each alert once. Reads the files this tool writes, and the same files after Excel has
+     saved them (compressed, shared strings). */
+
+  /* The files in an .xlsx (a zip), by name, as bytes. */
+  async function unzipXlsx(buf) {
+    var v = new DataView(buf), u8 = new Uint8Array(buf), out = {}, dec = new TextDecoder();
+    var e = buf.byteLength - 22;
+    while (e >= 0 && v.getUint32(e, true) !== 0x06054b50) e--;
+    if (e < 0) throw new Error('not an .xlsx file');
+    var n = v.getUint16(e + 10, true), p = v.getUint32(e + 16, true);
+    for (var k = 0; k < n; k++) {
+      var method = v.getUint16(p + 10, true), size = v.getUint32(p + 20, true);
+      var nameLen = v.getUint16(p + 28, true), extra = v.getUint16(p + 30, true), note = v.getUint16(p + 32, true);
+      var local = v.getUint32(p + 42, true), name = dec.decode(u8.subarray(p + 46, p + 46 + nameLen));
+      var start = local + 30 + v.getUint16(local + 26, true) + v.getUint16(local + 28, true);
+      var data = u8.subarray(start, start + size);
+      if (method === 8) {
+        var stream = new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+        data = new Uint8Array(await new Response(stream).arrayBuffer());
+      } else if (method !== 0) {
+        throw new Error('packed in a way this tool cannot read');
+      }
+      out[name] = data;
+      p += 46 + nameLen + extra + note;
+    }
+    return out;
+  }
+
+  /* The Narratives sheet's rows as objects, by header name, with the narrative's continued
+     cells joined back on. */
+  function readNarrativeRows(files) {
+    var dec = new TextDecoder(), xml = function (b) { return new DOMParser().parseFromString(dec.decode(b), 'application/xml'); };
+    var sheet = files['xl/worksheets/sheet1.xml'];
+    if (!sheet) throw new Error('no sheet in it');
+    var shared = [];
+    if (files['xl/sharedStrings.xml']) {
+      Array.prototype.forEach.call(xml(files['xl/sharedStrings.xml']).getElementsByTagName('si'), function (si) {
+        shared.push(Array.prototype.map.call(si.getElementsByTagName('t'), function (x) { return x.textContent; }).join(''));
+      });
+    }
+    var colOf = function (ref) {
+      var m = /^([A-Z]+)/.exec(ref || ''), c = 0;
+      for (var i = 0; m && i < m[1].length; i++) c = c * 26 + m[1].charCodeAt(i) - 64;
+      return c - 1;
+    };
+    var table = [];
+    Array.prototype.forEach.call(xml(sheet).getElementsByTagName('row'), function (r) {
+      var cells = [];
+      Array.prototype.forEach.call(r.getElementsByTagName('c'), function (c) {
+        var t = c.getAttribute('t'), val = '';
+        if (t === 'inlineStr') {
+          val = Array.prototype.map.call(c.getElementsByTagName('t'), function (x) { return x.textContent; }).join('');
+        } else {
+          var vEl = c.getElementsByTagName('v')[0], raw = vEl ? vEl.textContent : '';
+          val = t === 's' ? (shared[+raw] || '') : raw;
+        }
+        cells[colOf(c.getAttribute('r'))] = val;
+      });
+      table.push(cells);
+    });
+    var head = (table.shift() || []).map(function (h) { return clean(h); });
+    var col = function (name) { return head.indexOf(name); };
+    var cEcm = col('ECM ID'), cNarr = col('Narrative');
+    if (cEcm < 0 || cNarr < 0) throw new Error('not an ECM_Narratives file (no ECM ID / Narrative columns)');
+    var cont = [];
+    head.forEach(function (h, i) { if (/^Narrative \(continued/.test(h)) cont.push(i); });
+    var get = function (cells, i) { return i >= 0 && cells[i] != null ? String(cells[i]) : ''; };
+    return table.filter(function (cells) { return clean(get(cells, cEcm)); }).map(function (cells) {
+      var parts = [get(cells, cNarr)].concat(cont.map(function (i) { return get(cells, i); })).filter(Boolean);
+      var res = get(cells, col('Result'));
+      return {
+        ecm: clean(get(cells, cEcm)), velocity: get(cells, col('Velocity Alert ID')), customer: get(cells, col('Customer Name')),
+        decision: get(cells, col('Alert Analyst Decision')), narrative: parts.join(' '),
+        result: /^OK/.test(res) ? 'OK' : res || (parts.length ? 'OK' : 'no narrative found')
+      };
+    });
+  }
+
+  /* Files in the order they were made: the time in the name, then backup 1, 2 ... 10, then the
+     finished file of that run. */
+  function fileOrder(name) {
+    var m = /(\d{8}_\d{4,6})(?:_backup(\d+))?/.exec(name);
+    return m ? [m[1], m[2] ? +m[2] : 1e9] : ['', 0];
+  }
+
+  async function mergeNarrativeFiles(list) {
+    if (running) { log('A run is going - press Stop first.'); return; }
+    var files = Array.prototype.slice.call(list).sort(function (a, b) {
+      var x = fileOrder(a.name), y = fileOrder(b.name);
+      return x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : x[1] !== y[1] ? x[1] - y[1] : a.name < b.name ? -1 : 1;
+    });
+    if (!files.length) return;
+    running = true;
+    logEl.textContent = '';
+    progEl.textContent = '';
+    /* Each alert once. A narrative read beats "no narrative found", which beats an error;
+       otherwise the later file wins. */
+    var rank = function (r) { return r.result === 'OK' ? 2 : r.result === 'no narrative found' ? 1 : 0; };
+    var best = {}, firstSeen = [], rowsRead = 0, filesRead = 0;
+    try {
+      for (var f = 0; f < files.length; f++) {
+        progEl.textContent = 'Reading file ' + (f + 1) + ' of ' + files.length + ' ...';
+        try {
+          var rows = readNarrativeRows(await unzipXlsx(await files[f].arrayBuffer()));
+          rows.forEach(function (r) {
+            if (!best[r.ecm]) firstSeen.push(r.ecm);
+            if (!best[r.ecm] || rank(r) >= rank(best[r.ecm])) best[r.ecm] = r;
+          });
+          rowsRead += rows.length;
+          filesRead++;
+          log(files[f].name + ': ' + rows.length + ' alert(s)');
+        } catch (e) {
+          log(files[f].name + ': skipped - ' + e.message);
+        }
+      }
+      /* The order of the IDs in the box, if there are any (the full list), else as first seen. */
+      var boxIds = parseIds(box.value), order = boxIds.filter(function (id) { return best[id]; });
+      firstSeen.forEach(function (id) { if (boxIds.indexOf(id) < 0) order.push(id); });
+      var merged = order.map(function (id, i) { var r = best[id]; r.n = i + 1; return r; });
+      if (!merged.length) { log('No alerts found in those files.'); return; }
+      var name = 'ECM_Narratives_Merged_' + stampNow(true) + '.xlsx';
+      saveNarratives(merged, name);
+      var count = function (res) { return merged.filter(function (r) { return r.result === res; }).length; };
+      log('Saved ' + name + ': ' + merged.length + ' alert(s) from ' + filesRead + ' file(s) (' +
+        (rowsRead - merged.length) + ' repeated row(s) left out). ' + count('OK') + ' with a narrative, ' +
+        count('no narrative found') + ' with none, ' + (merged.length - count('OK') - count('no narrative found')) + ' failed.');
+      if (boxIds.length) {
+        var missing = boxIds.filter(function (id) { return !best[id] || rank(best[id]) === 0; });
+        if (missing.length) {
+          box.value = missing.join('\n');
+          updateCount();
+          log('Of the ' + boxIds.length + ' IDs that were in the box, ' + missing.length + ' are not in any file or failed. ' +
+            'They are now in the box: press Get narratives, then merge again with the new file added.');
+        } else {
+          log('Every one of the ' + boxIds.length + ' IDs in the box is in the merged file.');
+        }
+      } else {
+        log('To check none are missing, paste the full ID list in the box and merge again.');
+      }
+    } finally {
+      running = false;
+      progEl.textContent = '';
+    }
+  }
+
   /* A zip with each file stored as it is (no compression). */
   var CRC_TABLE = null;
   function crc32(bytes) {
@@ -979,6 +1126,18 @@
     box.focus();
   });
   btn('Copy for Excel', copyForExcel);
+  var picker = document.createElement('input');
+  picker.type = 'file';
+  picker.multiple = true;
+  picker.accept = '.xlsx';
+  picker.style.display = 'none';
+  picker.onchange = function () { var l = picker.files; mergeNarrativeFiles(l).then(function () { picker.value = ''; }); };
+  panel.appendChild(picker);
+  btn('Merge narrative files', function () {
+    if (running) { log('A run is going - press Stop first.'); return; }
+    log('Pick all the ECM_Narratives files to join (backups and finished ones). Tip: paste the full ID list in the box first, to see which are missing.');
+    picker.click();
+  }, false, true);
   panel.querySelector('.__ecmClose').onclick = function (e) { e.preventDefault(); stopped = true; panel.remove(); };
 
   document.body.appendChild(panel);

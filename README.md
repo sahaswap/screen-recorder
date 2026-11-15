@@ -92,6 +92,14 @@ the box: log in again in a new tab if needed, keep this tab open, and press the 
 alerts read by an earlier run of the same list that was stopped. The backup files can then be
 deleted. Press **Clear** to start a new list.
 
+**Merge narrative files** joins ECM_Narratives files into one `ECM_Narratives_Merged_<date>_<time>.xlsx`,
+for when a run was cut off (the tab closed, the VDI restarted) and the backups are all that is left:
+pick all of them, backups and finished files from any runs. Each alert appears once - a narrative
+read beats "no narrative found", which beats an error, otherwise the later file wins. Files Excel
+has saved can be picked too. Paste the full ID list in the box first: the merged file then follows
+its order, and the IDs in no file (or failed) are put in the box, ready for Get narratives; merge
+again with the new file added.
+
 Each alert's Statistics page is loaded in a hidden frame (not a pop-up, so nothing is
 blocked). The export is requested from that page so the file can be named with the alert ID.
 If that gets no file, the tool clicks the real Export button instead, and that file keeps
